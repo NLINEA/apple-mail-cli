@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${MAILCTL_PYTHON:-python3}" "$SCRIPT_DIRECTORY/../skills/apple-mail-cli/scripts/mailctl.py" "$@"

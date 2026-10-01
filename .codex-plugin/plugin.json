@@ -1,0 +1,42 @@
+{
+  "name": "apple-mail-cli",
+  "version": "0.4.3",
+  "description": "Shared JSON-first Apple Mail CLI with full-index search, safe high-volume scheduling, dashboards, and UBD OS handoff.",
+  "author": {
+    "name": "NLINEA"
+  },
+  "skills": "./skills/",
+  "license": "MIT",
+  "keywords": [
+    "apple-mail",
+    "mail",
+    "macos",
+    "cli",
+    "email",
+    "outreach",
+    "ubd-os"
+  ],
+  "interface": {
+    "displayName": "Apple Mail CLI",
+    "shortDescription": "Guarded Apple Mail search, triage, campaigns, and scheduling.",
+    "longDescription": "A local JSON-first Apple Mail interface shared by Codex and Hermes: search the full metadata index and conversations, classify bilingual replies and bounces, create visible drafts, rebalance high-volume schedules against account quotas, run resumable visible Send Later sessions, reconcile exact recipient sets without writing to Mail's database, and hand redacted dashboards to UBD OS through its human-review proposal API.",
+    "developerName": "NLINEA",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Summarize new Apple Mail replies and bounces.",
+      "Search my Apple Mail history and show the complete matching conversations.",
+      "Audit this outreach manifest against Sent and Send Later.",
+      "Rebalance this Apple Mail campaign to finish by my deadline without exceeding daily volume or minimum-gap policy.",
+      "Show the campaign dashboard and safely resume the next verified Send Later batch.",
+      "Create visible Apple Mail drafts from this campaign manifest.",
+      "Attach this redacted Apple Mail campaign audit to the matching UBD OS work item for human review.",
+      "Classify this Apple Mail reply and propose the redacted result on the matching UBD OS work item.",
+      "Attach a redacted Apple Mail campaign dashboard to the matching UBD OS work item for human review."
+    ],
+    "brandColor": "#2875D4"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apple Mail CLI"
+  short_description: "Guarded Apple Mail search, triage, campaigns, scheduling, and UBD OS"
+  default_prompt: "Use $apple-mail-cli to discover its safety contract, search full Mail conversations, triage replies, rebalance and audit an integrity-bound outreach queue, resume only index-verified visible scheduling sessions, and prepare a redacted human-review UBD OS dashboard when requested."
