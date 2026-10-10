@@ -32,6 +32,7 @@ import send_guard
 import operation_state
 import batch_read
 import mail_workflow
+import draft_review
 
 
 VERSION = "0.6.0"
@@ -46,12 +47,29 @@ ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAX_BODY_CHARS = 5_000_000
 
 
+def draft_failure_diagnostics(value: Any) -> dict | None:
+    """Allowlist private, content-free observations, never retry authority."""
+    fields = {"sender", "to", "cc", "bcc", "subject", "body", "attachments_unverified",
+              "attachment_references", "attachment_bytes", "draft_changed"}
+    if not isinstance(value, dict) or value.get("stage") != "draft_verification" or value.get("send_invoked") is not False:
+        return None
+    mismatches = value.get("mismatch_fields")
+    if (type(value.get("draft_id")) is not int or value["draft_id"] < 0
+            or not isinstance(mismatches, list) or not mismatches or len(mismatches) > len(fields)
+            or any(not isinstance(item, str) or item not in fields for item in mismatches)
+            or not isinstance(value.get("body_comparison"), str)
+            or value.get("body_comparison") not in {"exact", "mail_empty_paragraphs", "mismatch"}):
+        return None
+    return {key: value[key] for key in ("stage", "draft_id", "send_invoked", "mismatch_fields", "body_comparison")}
+
+
 class MailCtlError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "mailctl_error", hint: str | None = None, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, code: str = "mailctl_error", hint: str | None = None, retryable: bool = False, diagnostics: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.hint = hint
         self.retryable = retryable
+        self.diagnostics = draft_failure_diagnostics(diagnostics)
 
 
 def emit(payload: dict[str, Any], *, compact: bool = False) -> None:
@@ -135,7 +153,8 @@ def run_backend(payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         if "not authorized" in message.lower() or "-1743" in message:
             message += " Allow Codex or Terminal to control Mail in System Settings > Privacy & Security > Automation."
             raise MailCtlError(message, code="mail_permission_denied")
-        raise MailCtlError(message, code="mail_command_failed", hint="Audit actual Mail state before retrying.")
+        raise MailCtlError(message, code="mail_command_failed", hint="Audit actual Mail state before retrying.",
+                           diagnostics=result["error"].get("diagnostics") if payload.get("command") == "send" else None)
     return result
 
 
@@ -254,6 +273,24 @@ def draft_snapshot(draft: dict) -> dict:
     return {key: draft.get(key) for key in DRAFT_FIELDS}
 
 
+def body_readback_comparison(actual: str, expected: str) -> str:
+    """Compare exact text or Mail's complete LF-empty-paragraph projection.
+
+    Project the approved text, never strip/trim/normalize the observed text.
+    Literal separators, whitespace-only lines, Unicode and line counts survive.
+    This describes an editor representation, not MIME byte equivalence.
+    Keep the JXA bodyReadbackComparison implementation and regression cases aligned.
+    """
+    if not isinstance(actual, str) or not isinstance(expected, str):
+        return "mismatch"
+    if actual == expected:
+        return "exact"
+    lines = expected.split("\n")
+    rendered = "\n".join("\u2028" if line == "" and index < len(lines) - 1 else line
+                         for index, line in enumerate(lines))
+    return "mail_empty_paragraphs" if actual == rendered else "mismatch"
+
+
 def draft_verification(draft: dict, expected: dict, attachments: list[dict]) -> dict:
     mismatches = []
     for field in ("to", "cc", "bcc"):
@@ -270,8 +307,8 @@ def draft_verification(draft: dict, expected: dict, attachments: list[dict]) -> 
         mismatches.append("sender")
     if draft.get("subject") != expected["subject"]:
         mismatches.append("subject")
-    # Rich-text attachment markers are not silently stripped: uncertain body evidence blocks sending.
-    if draft.get("content") != expected["body"]:
+    body_comparison = body_readback_comparison(draft.get("content"), expected["body"])
+    if body_comparison == "mismatch":
         mismatches.append("body")
     actual = draft.get("attachments")
     hashes_checked = False
@@ -296,6 +333,7 @@ def draft_verification(draft: dict, expected: dict, attachments: list[dict]) -> 
         except (ValueError, OSError, MailCtlError):
             mismatches.append("attachments_unverified")
     return {"verified": not mismatches, "mismatch_fields": mismatches, "attachment_sha256_checked": hashes_checked,
+            "body_comparison": body_comparison, "body_exact_match": body_comparison == "exact",
             "evidence": "open_draft_readback_and_referenced_files", "delivery_verified": False}
 
 
@@ -489,17 +527,26 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = sub.add_parser("resolve", help="Resolve an exact RFC Message-ID to a current Mail object in one mailbox.")
     resolve.add_argument("rfc_message_id")
     add_location(resolve)
-    draft = sub.add_parser("draft", help="Inspect, verify, or revision-guard an open outgoing draft.")
+    draft = sub.add_parser("draft", help="Inspect or save an open draft; review one exact saved copy without sending.")
     draft_sub = draft.add_subparsers(dest="draft_command", required=True)
-    for name in ("show", "verify", "update"):
+    for name in ("show", "verify", "update", "save"):
         item = draft_sub.add_parser(name)
         item.add_argument("draft_id", type=int)
         if name in {"verify", "update"}:
             add_outgoing(item)
-        if name == "update":
+        if name in {"update", "save"}:
             item.add_argument("--expected-revision", required=True)
             item.add_argument("--confirm-change", action="store_true", required=True)
             item.add_argument("--operation-id")
+    saved_list = draft_sub.add_parser("saved-list", help="Find saved Drafts candidates; same subject is not an editor link.")
+    saved_list.add_argument("--account", required=True)
+    saved_list.add_argument("--subject", required=True, help="Exact subject; metadata only, at most 50 candidates.")
+    saved_review = draft_sub.add_parser("review-saved", help="Inspect MIME attachment bytes in one exact saved copy; never authorizes sending.")
+    saved_review.add_argument("rfc_message_id")
+    saved_review.add_argument("--account", required=True)
+    add_outgoing(saved_review)
+    saved_review.add_argument("--output", help="New private review JSON, containing message bodies; never upload it.")
+    saved_review.add_argument("--expected-review-digest", help="Reject stale saved-copy evidence; this is NOT a send confirmation.")
     attachments = sub.add_parser("attachments", help="List message attachment metadata or save one exact attachment locally.")
     attachments_sub = attachments.add_subparsers(dest="attachments_command", required=True)
     for name in ("list", "save"):
@@ -720,6 +767,7 @@ def capabilities() -> dict[str, Any]:
                     "mutation receipts and ownership claims",
                     "receipt-reconcile",
                     "campaign followups --output",
+                    "draft review-saved --output",
                 ],
                 "mail_read_only": [
                     "doctor",
@@ -736,6 +784,8 @@ def capabilities() -> dict[str, Any]:
                     "resolve",
                     "draft show",
                     "draft verify",
+                    "draft saved-list",
+                    "draft review-saved",
                     "attachments list",
                     "campaign explain",
                     "classify",
@@ -751,7 +801,7 @@ def capabilities() -> dict[str, Any]:
                     "ubd dashboard-event",
                     "ubd classify-event",
                 ],
-                "mail_draft_mutation": ["compose", "reply", "draft update"],
+                "mail_draft_mutation": ["compose", "reply", "draft update", "draft save"],
                 "mail_confirmed_mutation": ["mark", "flag", "move", "trash", "send"],
                 "ubd_read_only": ["ubd capabilities", "ubd work-list", "ubd work-get"],
                 "ubd_proposal_only": ["ubd propose-campaign-audit", "ubd propose-classification", "ubd propose-dashboard", "ubd retry-proposal"],
@@ -768,6 +818,9 @@ def capabilities() -> dict[str, Any]:
                 "direct_send_has_durable_local_attempt_guard": True,
                 "direct_send_error_is_retryable": False,
                 "direct_send_intent_schema": send_guard.INTENT_SCHEMA,
+                "saved_draft_review_never_authorizes_send": True,
+                "saved_draft_review_verifies_open_editor_link": False,
+                "saved_draft_review_requires_visual_and_human_review": True,
                 "supplied_sender_requires_unique_enabled_account": True,
                 "scheduled_attachment_match_requires_emlx_byte_evidence": True,
                 "unknown_campaign_mailbox_blocks_continuation": True,
@@ -1163,7 +1216,8 @@ def guarded_send(args: argparse.Namespace, *, prepared=None) -> dict[str, Any]:
             attempt.finish("outcome_unknown")
         except Exception:
             pass
-        raise MailCtlError("Send outcome is unknown and this intent remains blocked. Inspect Mail and the private attempt record; do not retry automatically.", code="send_outcome_unknown", hint="A timeout, backend error, or missing durable final record cannot establish whether Mail accepted the message.", retryable=False) from error
+        raise MailCtlError("Send outcome is unknown and this intent remains blocked. Inspect Mail and the private attempt record; do not retry automatically.", code="send_outcome_unknown", hint="A timeout, backend error, or missing durable final record cannot establish whether Mail accepted the message.", retryable=False,
+                           diagnostics=getattr(error, "diagnostics", None)) from error
     result["attempt"] = {"intent_digest": digest, "state": "accepted_by_mail", "retryable": False}
     return result
 
@@ -1508,7 +1562,44 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "draft":
         if args.draft_command == "update":
             return prepare_verified_draft(args, update=True)
+        if args.draft_command in {"saved-list", "review-saved"}:
+            if not args.account.strip() or HEADER_CONTROL_PATTERN.search(args.account):
+                raise MailCtlError("A valid exact Mail account name is required.")
+            if args.draft_command == "saved-list":
+                if not args.subject or len(args.subject) > 998 or HEADER_CONTROL_PATTERN.search(args.subject):
+                    raise MailCtlError("A valid exact subject is required.")
+                result = run_backend({"command": "draft_saved_list", "account": args.account, "subject": args.subject}, args.timeout)
+                result["command"] = "draft saved-list"
+                return result
+            try:
+                selected_id = draft_review.message_id(args.rfc_message_id)
+                expected_digest = args.expected_review_digest
+                if expected_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                    raise draft_review.DraftReviewError("Expected review digest must be a SHA-256 value.")
+                payload, evidence = outgoing_preflight(args, "send")  # Strict expectations only; never reserves a send.
+                intent = send_guard.canonical_intent(payload, evidence)
+                snapshot = run_backend({"command": "draft_saved_source", "account": args.account,
+                                        "rfc_message_id": selected_id}, args.timeout)["data"]
+                if (not isinstance(snapshot, dict) or snapshot.get("account", "").lower() != args.account.lower()
+                        or draft_review.message_id(snapshot.get("message_id")) != selected_id):
+                    raise draft_review.DraftReviewError("Backend saved identity does not match the requested account and Message-ID.")
+                data = draft_review.inspect_saved(snapshot, intent, body_readback_comparison, expected_review_digest=expected_digest)
+            except draft_review.DraftReviewError as error:
+                raise MailCtlError(str(error), code="saved_draft_review_unverified",
+                                   hint="Inspect the exact saved draft in Mail; do not send or retry automatically.") from error
+            result = {"ok": True, "command": "draft review-saved", "data": data}
+            if args.output:
+                result["output"] = write_private_json(args.output, result)
+            return result
         current = draft_snapshot(run_backend({"command": "draft_read", "draft_id": args.draft_id}, args.timeout)["data"])
+        if args.draft_command == "save":
+            if not args.confirm_change or operation_state.digest(current) != args.expected_revision:
+                raise MailCtlError("Draft revision changed or save was not confirmed. Read it again before saving.")
+            result = run_backend({"command": "draft_save", "draft_id": args.draft_id,
+                                  "expected_snapshot": current, "confirm_change": True}, args.timeout)
+            result["command"] = "draft save"
+            result["data"]["revision"] = operation_state.digest(draft_snapshot(result["data"]["draft"]))
+            return result
         data = {**current, "revision": operation_state.digest(current), "sent": False}
         if args.draft_command == "verify":
             payload, evidence = outgoing_preflight(args, "compose")
@@ -1790,7 +1881,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         return guarded_send(args)  # Offline preview must not create receipts or load Mail.
     mutations = {"compose", "send", "reply", "mark", "flag", "move", "trash"}
     draft_update = args.command == "draft" and args.draft_command == "update"
-    if args.command not in mutations and not draft_update:
+    draft_save = args.command == "draft" and args.draft_command == "save"
+    if args.command not in mutations and not draft_update and not draft_save:
         return _execute(args)
     operation_id = str(uuid.UUID(args.operation_id)) if args.operation_id else str(uuid.uuid4())
     request = {key: value for key, value in vars(args).items() if key not in {"operation_id", "compact", "timeout"}}
@@ -1822,10 +1914,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         operation_state.transition(operation_id, state, result)
         return result
     except BaseException as error:
-        operation_state.transition(operation_id, "unknown")
+        failure = None
         if isinstance(error, MailCtlError):
             error.retryable = False
             error.hint = f"Inspect mailctl receipt {operation_id}; do not retry the mutation automatically."
+            if error.diagnostics:
+                failure = structured_error(error, args.command)
+        operation_state.transition(operation_id, "unknown", failure)
         raise
 
 
@@ -1863,6 +1958,7 @@ def structured_error(error: Exception, command: str | None) -> dict[str, Any]:
             "message": message,
             "hint": hint,
             "retryable": retryable,
+            **({"diagnostics": error.diagnostics} if isinstance(error, MailCtlError) and error.diagnostics else {}),
         },
     }
 

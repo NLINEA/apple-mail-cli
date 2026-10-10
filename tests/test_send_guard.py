@@ -9,6 +9,8 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import subprocess
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest import mock
@@ -19,6 +21,76 @@ import send_guard
 
 
 class GuardedSendTests(unittest.TestCase):
+    def test_body_readback_accepts_only_exact_or_complete_empty_paragraph_projection(self):
+        for body in ("香港 café\n\nEnd\n\n", "One\n\n\nTwo\n", "\nStart\n\n", "Keep \n \nspacing", "Literal\u2028text\n\n"):
+            rendered = "\n".join("\u2028" if line == "" and index < len(body.split("\n")) - 1 else line
+                                 for index, line in enumerate(body.split("\n")))
+            with self.subTest(body=body):
+                self.assertEqual(mailctl.body_readback_comparison(body, body), "exact")
+                self.assertIn(mailctl.body_readback_comparison(rendered, body), ("exact", "mail_empty_paragraphs"))
+                for changed in (body + "signature", body + "\u2028", body.replace("\n", "\r\n"), "\ufffc" + body):
+                    if changed != body:
+                        self.assertEqual(mailctl.body_readback_comparison(changed, body), "mismatch")
+        self.assertEqual(mailctl.body_readback_comparison("One\u2028\n\n", "One\n\n"), "mismatch")
+        self.assertEqual(mailctl.body_readback_comparison("One\n\u2028\n\nEnd", "One\n\n\nEnd"), "mismatch")
+        self.assertEqual(mailctl.body_readback_comparison("Literaltext\n\n", "Literal\u2028text\n\n"), "mismatch")
+
+    def test_native_null_attachments_remain_unknown_after_body_compatibility(self):
+        expected = dict(sender="sender@example.test", to=["recipient@example.test"], cc=[], bcc=[], subject="Test", body="One\n\nEnd\n\n")
+        current = {**expected, "content": "One\n\u2028\nEnd\n\u2028\n", "attachments": None}
+        result = mailctl.draft_verification(current, expected, [])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["mismatch_fields"], ["attachments_unverified"])
+        self.assertEqual(result["body_comparison"], "mail_empty_paragraphs")
+        self.assertFalse(result["body_exact_match"])
+        self.assertFalse(result["attachment_sha256_checked"])
+
+    def test_native_draft_diagnostics_survive_unknown_send_without_enabling_retry(self):
+        diagnostics = {"stage": "draft_verification", "draft_id": 99, "send_invoked": False,
+                       "mismatch_fields": ["attachments_unverified"], "body_comparison": "mail_empty_paragraphs"}
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps({"ok": False, "command": "send",
+            "error": {"message": "Draft verification failed; it remains unsent.", "diagnostics": diagnostics}}), stderr="")
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(send_guard, "state_root", return_value=Path(temporary) / "state"), mock.patch.object(mailctl.shutil, "which", return_value="synthetic-osascript"), mock.patch.object(mailctl.subprocess, "run", return_value=completed) as backend:
+            args = self.args()
+            args.confirm_send = self.preview(args)["intent_digest"]
+            with self.assertRaises(mailctl.MailCtlError) as caught:
+                mailctl.guarded_send(args)
+            error = mailctl.structured_error(caught.exception, "send")["error"]
+            self.assertEqual(error["code"], "send_outcome_unknown")
+            self.assertEqual(error["diagnostics"], diagnostics)
+            self.assertFalse(error["retryable"])
+            with self.assertRaises(send_guard.SendGuardError):
+                mailctl.guarded_send(args)
+            self.assertEqual(backend.call_count, 1)
+
+    def test_diagnostics_are_content_free_strict_and_cannot_claim_send_success(self):
+        good = {"stage": "draft_verification", "draft_id": 99, "send_invoked": False,
+                "mismatch_fields": ["attachments_unverified"], "body_comparison": "exact"}
+        self.assertEqual(mailctl.draft_failure_diagnostics({**good, "private_body": "do not expose"}), good)
+        for change in ({"send_invoked": True}, {"send_invoked": 0}, {"draft_id": True}, {"draft_id": "99"},
+                       {"body_comparison": []}, {"body_comparison": {}}, {"mismatch_fields": [None]},
+                       {"mismatch_fields": ["private address"]}, {"mismatch_fields": []}):
+            with self.subTest(change=change):
+                self.assertIsNone(mailctl.draft_failure_diagnostics({**good, **change}))
+
+    def test_receipt_keeps_draft_failure_observation_but_stays_unknown(self):
+        import operation_state
+        diagnostics = {"stage": "draft_verification", "draft_id": 99, "send_invoked": False,
+                       "mismatch_fields": ["attachments_unverified"], "body_comparison": "mail_empty_paragraphs"}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {"MAILCTL_STATE_DIR": temporary}), mock.patch.object(send_guard, "state_root", return_value=Path(temporary) / "attempts"):
+            args = self.args(operation_id=str(uuid.uuid4()))
+            args.confirm_send = self.preview(args)["intent_digest"]
+            error = mailctl.MailCtlError("Draft failed", diagnostics=diagnostics)
+            with mock.patch.object(mailctl, "run_backend", side_effect=error) as backend:
+                with self.assertRaises(mailctl.MailCtlError):
+                    mailctl.execute(args)
+                receipt = operation_state.get(args.operation_id)
+                self.assertEqual(receipt["state"], "unknown")
+                self.assertEqual(receipt["result"]["error"]["diagnostics"], diagnostics)
+                with self.assertRaises(mailctl.MailCtlError):
+                    mailctl.execute(args)
+                self.assertEqual(backend.call_count, 1)
+
     def args(self, **changes):
         values = dict(command="send", to=["Recipient <recipient@example.test>"], cc=["copy@example.test"],
                       bcc=["private-copy@example.test"], sender="sender@example.test", subject="香港 café",

@@ -257,4 +257,125 @@ for (const drift of ["bcc", "body", "attachment"]) {
   assert.equal(fake.run().ok, false, "uncertain attempts cannot retry");
   checks += 1;
 }
+// Native Mail's empty paragraphs contain U+2028, but non-empty text and all
+// spacing must still match. Do not normalize arbitrary observed characters.
+for (const body of ["香港 café\n\nEnd\n\n", "One\n\n\nTwo\n", "\nStart\n\n", "Keep \n \nspacing", "Literal\u2028text\n\n"]) {
+  const fake = contextFor({});
+  const lines = body.split("\n");
+  const rendered = lines.map((line, i) => line === "" && i < lines.length - 1 ? "\u2028" : line).join("\n");
+  assert.equal(fake.ctx.bodyReadbackComparison(body, body), "exact");
+  assert.ok(["exact", "mail_empty_paragraphs"].includes(fake.ctx.bodyReadbackComparison(rendered, body)));
+  for (const changed of [body + "signature", body + "\u2028", body.replace(/\n/g, "\r\n"), "\ufffc" + body]) {
+    if (changed !== body) assert.equal(fake.ctx.bodyReadbackComparison(changed, body), "mismatch");
+  }
+  checks++;
+}
+for (const defect of ["none", "unavailable", "throws", "malformed", "nonabsolute", "extra", "partial_body", "nonempty_marker"]) {
+  let sends = 0, outgoing;
+  const payload = syntheticSendPayload();
+  payload.body = "First\n\nSecond\n\n";
+  const mail = { accounts: () => [account("Work", "sender@example.test")],
+    OutgoingMessage: properties => (outgoing = outgoingFixture(properties, () => { sends++; return true; })),
+    outgoingMessages: [], ToRecipient: value => value, CcRecipient: value => value, BccRecipient: value => value,
+    Attachment: value => {
+      outgoing.content = payload.body.replace(/\n(?=\n)/g, "\n\u2028");
+      if (defect === "partial_body") outgoing.content = "First\n\u2028\nSecond\n\n";
+      if (defect === "nonempty_marker") outgoing.content = "First\u2028\n\nSecond\n\n";
+      if (["unavailable", "throws", "malformed"].includes(defect)) {
+        const unreadable = () => {
+          if (defect === "throws") throw new Error("Native attachments unavailable");
+          return defect === "malformed" ? {} : null;
+        };
+        unreadable.push = () => {};
+        outgoing.content.attachments = unreadable;
+      }
+      if (defect === "extra") outgoing.content.attachments.push({ fileName: "/extra.pdf" });
+      return defect === "nonabsolute" ? { fileName: "approved.pdf" } : value;
+    }
+  };
+  const fake = contextFor(payload, mail);
+  prepareSend(fake, payload, [{ name: "approved.pdf", bytes: Buffer.from("approved") }]);
+  const result = fake.run();
+  assert.equal(result.ok, defect === "none");
+  assert.equal(sends, defect === "none" ? 1 : 0);
+  if (!result.ok) {
+    assert.equal(result.error.diagnostics.send_invoked, false);
+    assert.equal(result.error.diagnostics.draft_id, 99);
+    assert.ok(result.error.diagnostics.mismatch_fields.length > 0);
+  }
+  assert.equal(fake.run().ok, false, "compatibility or better diagnostics must never enable replay");
+  checks++;
+}
+for (const payload of [{ command: "draft_save" }, { command: "draft_save", confirm_change: true, draft_id: -1 },
+                       { command: "draft_save", confirm_change: true, draft_id: 7 },
+                       { command: "draft_saved_list", subject: "Test" },
+                       { command: "draft_saved_list", account: "Work", subject: "" },
+                       { command: "draft_saved_source", account: "Work", rfc_message_id: "a@b@c" }]) {
+  const fake = contextFor(payload);
+  assert.equal(fake.run().ok, false);
+  assert.equal(fake.calls(), 0);
+  checks++;
+}
+for (const changed of [false, true]) {
+  let saves = 0;
+  const draft = outgoingFixture({ subject: "Saved", sender: "sender@example.test", content: "Body", visible: true }, () => { throw new Error("never send"); });
+  draft.content.attachments = () => null;
+  const payload = { command: "draft_save", draft_id: 99, confirm_change: true };
+  const fake = contextFor(payload, { outgoingMessages: { byId: () => draft }, save: () => { saves++; } });
+  payload.expected_snapshot = fake.ctx.draftSnapshot(draft);
+  if (changed) draft.subject = "Changed";
+  const result = fake.run();
+  assert.equal(result.ok, !changed);
+  assert.equal(saves, changed ? 0 : 1);
+  if (!changed) {
+    assert.equal(result.data.sent, false);
+    assert.equal(result.data.saved_copy_verified, false);
+    assert.equal(result.data.open_draft_link_verified, false);
+    assert.equal(result.data.draft.attachments, null);
+  }
+  checks++;
+}
+
+function savedFixture({ duplicate = false, mutateSource = false, mutateIdentity = false, removeOnRecheck = false, tooMany = false, otherAccount = false } = {}) {
+  let sourceReads = 0, queries = 0;
+  const owner = { name: () => "Work", id: () => "account-1" };
+  const another = { name: () => "Other", id: () => "account-2" };
+  const item = { id: () => mutateIdentity && sourceReads ? 43 : 42,
+    messageId: () => "saved-1@example.test", subject: () => "Exact subject", sender: () => "sender@example.test",
+    mailbox: () => ({ account: () => otherAccount ? another : owner }),
+    source: () => { sourceReads++; return mutateSource ? "source " + sourceReads : "Stable synthetic source"; } };
+  const messages = { whose: predicate => () => {
+    queries++;
+    if (removeOnRecheck && queries > 2) return [];
+    if (predicate.messageId && predicate.messageId !== item.messageId()) return [];
+    if (tooMany) return Array(51).fill(item);
+    return duplicate ? [item, { ...item, id: () => 44 }] : [item];
+  } };
+  return { accounts: () => [owner, another], draftsMailbox: () => ({ messages }),
+    save: () => { throw new Error("review must not save"); }, sourceReads: () => sourceReads };
+}
+const savedList = contextFor({ command: "draft_saved_list", account: "Work", subject: "Exact subject" }, savedFixture({ duplicate: true }));
+const listed = savedList.run();
+assert.equal(listed.ok, true);
+assert.equal(listed.data.candidates.length, 2);
+assert.equal(listed.data.candidates_only, true);
+assert.equal(listed.data.open_draft_link_verified, false);
+checks++;
+const caseDifferent = contextFor({ command: "draft_saved_list", account: "Work", subject: "EXACT SUBJECT" }, savedFixture());
+assert.equal(caseDifferent.run().data.candidates.length, 0);
+checks++;
+for (const options of [{}, { duplicate: true }, { mutateSource: true }, { mutateIdentity: true },
+                       { removeOnRecheck: true }, { tooMany: true }, { otherAccount: true }]) {
+  const mail = savedFixture(options);
+  const fake = contextFor({ command: "draft_saved_source", account: "Work", rfc_message_id: "<saved-1@example.test>" }, mail);
+  const result = fake.run();
+  assert.equal(result.ok, Object.keys(options).length === 0, JSON.stringify(options));
+  if (result.ok) {
+    assert.equal(result.data.source_stable, true);
+    assert.equal(result.data.account_id, "account-1");
+    assert.equal(result.data.message_id, "<saved-1@example.test>");
+    assert.equal(mail.sourceReads(), 2);
+  }
+  checks++;
+}
 console.log(JSON.stringify({ synthetic_backend_checks: checks, ok: true, mail_loaded: false }));
