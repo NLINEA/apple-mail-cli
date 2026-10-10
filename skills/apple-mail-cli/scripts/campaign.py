@@ -1690,6 +1690,32 @@ def next_session_operations(
                           "message_ids": results[op["key"]].get("distinct_message_ids", [])})
             if len(batch) >= max(1, min(int(limit), 100)):
                 break
+        if batch:
+            try:
+                # A different session may finish and release the same mail
+                # after our initial audit but before claim_many succeeds.
+                # Re-read under every acquired claim, without cached MIME
+                # evidence, before publishing any work to the caller.
+                latest = audit_campaign(session["manifest_path"], database=database, fresh=True)
+                current = {row["key"]: row for row in latest["results"]}
+                if (len(current) != len(latest["results"]) or set(current) != set(results)
+                        or any(row["status"] == "duplicate" or set(row.get("issues", [])) - allowed
+                               for row in latest["results"])):
+                    raise CampaignError("Mail evidence became unsafe after ownership was acquired; reconcile before continuing.")
+                for item in batch:
+                    before, after = results[item["key"]], current[item["key"]]
+                    before_ids = {normalize_message_id(value) for value in before.get("distinct_message_ids", [])}
+                    after_ids = {normalize_message_id(value) for value in after.get("distinct_message_ids", [])}
+                    if before["status"] != after["status"] or before_ids != after_ids:
+                        raise CampaignError("Mail evidence changed after ownership was acquired; reconcile before continuing.")
+            except Exception:
+                # No batch was returned or persisted and no Mail action was
+                # attempted. Release only this call's unissued claims; keep
+                # pre-existing/in-flight claims and crash recovery unchanged.
+                for item in batch:
+                    operation_state.release(f"{session['campaign_id']}:{item['key']}", item["claim_token"])
+                raise
+            session["last_audit"] = latest["summary"]
         write_private_json_atomic(path, session)
         return {**session_status(str(path)), "remaining_actionable": len(actionable), "batch_size": len(batch), "batch": batch, "blocked_claims": blocked,
                 "instruction": "Use each claim_token with session-record. Claims never expire into automatic retries; audit uncertain operations first."}

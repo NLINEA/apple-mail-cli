@@ -76,6 +76,164 @@ class V060Tests(unittest.TestCase):
         workers = [subprocess.Popen([sys.executable, "-c", source, str(i)], env=env, stdout=subprocess.PIPE, text=True) for i in range(4)]
         self.assertEqual([worker.communicate(timeout=10)[0].strip() for worker in workers].count("True"), 1)
 
+    def test_released_claim_cannot_issue_work_from_stale_missing_audit(self):
+        first, second = self.session("first"), self.session("second")
+        with mock.patch.object(campaign, "audit_campaign", side_effect=lambda *a, **kw: self.missing()):
+            work = campaign.next_session_operations(str(first))["batch"][0]
+        campaign.record_schedule_session(str(first), key=work["key"], result="applied", claim_token=work["claim_token"])
+        scheduled = self.missing()
+        scheduled["results"][0].update(status="scheduled", distinct_message_ids=["<scheduled@example.com>"])
+        scheduled["summary"]["statuses"] = {"scheduled": 1}
+        real_claim = operation_state.claim_many
+        published = []
+
+        def finish_first_then_claim(*args, **kwargs):
+            with mock.patch.object(campaign, "audit_campaign", return_value=scheduled):
+                campaign.reconcile_schedule_session(str(first))
+            published.append(True)
+            return real_claim(*args, **kwargs)
+
+        def observe(*args, **kwargs):
+            return scheduled if published else self.missing()
+
+        with mock.patch.object(campaign, "audit_campaign", side_effect=observe), mock.patch.object(
+            operation_state, "claim_many", side_effect=finish_first_then_claim
+        ):
+            with self.assertRaisesRegex(campaign.CampaignError, "after ownership"):
+                campaign.next_session_operations(str(second))
+        self.assertEqual(campaign.session_status(str(first))["statuses"], {"verified": 1})
+        self.assertEqual(campaign.session_status(str(second))["statuses"], {"pending": 1})
+        self.assertEqual(campaign.session_status(str(second))["active_claims"], {})
+        self.assertEqual(list((self.root / "state" / "claims").glob("*.json")), [])
+        with mock.patch.object(campaign, "audit_campaign", return_value=scheduled):
+            self.assertEqual(campaign.next_session_operations(str(second))["batch_size"], 0)
+
+    def test_post_claim_audit_is_fresh_and_all_claims_are_held(self):
+        session = self.session()
+        observations = []
+
+        def observe(*args, **kwargs):
+            claim = operation_state.inspect_claim("one:row-0001")
+            observations.append((kwargs.get("fresh", False), claim is not None))
+            return self.missing()
+
+        with mock.patch.object(campaign, "audit_campaign", side_effect=observe):
+            work = campaign.next_session_operations(str(session))
+        self.assertEqual(observations, [(False, False), (True, True)])
+        self.assertEqual(work["batch_size"], 1)
+        self.assertEqual(campaign.session_status(str(session))["statuses"], {"claimed": 1})
+
+    def test_post_claim_audit_failure_releases_only_unissued_claims(self):
+        session = self.session()
+        self.assertTrue(operation_state.claim("unrelated", "other", "other-token", "other-session"))
+        with mock.patch.object(campaign, "audit_campaign", side_effect=[self.missing(), OSError("fixture audit failure")]):
+            with self.assertRaisesRegex(OSError, "fixture audit failure"):
+                campaign.next_session_operations(str(session))
+        self.assertEqual(campaign.session_status(str(session))["statuses"], {"pending": 1})
+        self.assertEqual(campaign.session_status(str(session))["active_claims"], {})
+        self.assertEqual(operation_state.inspect_claim("unrelated")["token"], "other-token")
+        self.assertEqual(len(list((self.root / "state" / "claims").glob("*.json"))), 1)
+
+    def test_post_claim_unsafe_or_missing_evidence_blocks_handoff(self):
+        for index, change in enumerate((
+            {"status": "duplicate"}, {"issues": ["wrong_sender"]},
+            {"issues": ["attachment_unverified"]}, {"issues": ["wrong_recipients"]},
+            {"status": "sent", "distinct_message_ids": ["<sent@example.com>"]}, None, "duplicate_rows",
+        )):
+            with self.subTest(change=change):
+                session = self.session("unsafe-" + str(index))
+                latest = self.missing()
+                if change is None:
+                    latest["results"] = []
+                elif change == "duplicate_rows":
+                    latest["results"].append(dict(latest["results"][0]))
+                else:
+                    latest["results"][0].update(change)
+                with mock.patch.object(campaign, "audit_campaign", side_effect=[self.missing(), latest]):
+                    with self.assertRaisesRegex(campaign.CampaignError, "after ownership"):
+                        campaign.next_session_operations(str(session))
+                self.assertEqual(campaign.session_status(str(session))["active_claims"], {})
+                self.assertEqual(campaign.session_status(str(session))["statuses"], {"pending": 1})
+
+    def test_post_claim_reschedule_and_cancel_reject_changed_message_id(self):
+        for action in ("reschedule", "cancel"):
+            with self.subTest(action=action):
+                session = self.session(action)
+                value = json.loads(session.read_text())
+                value["action"] = action
+                value["operations"][0]["message_ids"] = ["<old@example.com>"]
+                session.write_text(json.dumps(value))
+                before = self.missing()
+                before["results"][0].update(status="wrong_time", issues=["wrong_time"], distinct_message_ids=["<old@example.com>"])
+                latest = self.missing()
+                latest["results"][0].update(status="wrong_time", issues=["wrong_time"], distinct_message_ids=["<replacement@example.com>"])
+                with mock.patch.object(campaign, "audit_campaign", side_effect=[before, latest]):
+                    with self.assertRaisesRegex(campaign.CampaignError, "after ownership"):
+                        campaign.next_session_operations(str(session))
+                self.assertEqual(campaign.session_status(str(session))["active_claims"], {})
+                self.assertEqual(campaign.session_status(str(session))["operations"][0]["message_ids"], ["<old@example.com>"])
+
+    def test_post_claim_unchanged_reschedule_and_cancel_keep_pinned_target(self):
+        for action in ("reschedule", "cancel"):
+            with self.subTest(action=action):
+                session = self.session("unchanged-" + action)
+                value = json.loads(session.read_text())
+                value["action"] = action
+                value["operations"][0]["message_ids"] = ["<old@example.com>"]
+                session.write_text(json.dumps(value))
+                audit = self.missing()
+                audit["results"][0].update(status="wrong_time", issues=["wrong_time"], distinct_message_ids=["<old@example.com>"])
+                with mock.patch.object(campaign, "audit_campaign", return_value=audit):
+                    work = campaign.next_session_operations(str(session))["batch"][0]
+                self.assertEqual(work["message_ids"], ["<old@example.com>"])
+                self.assertIn("mail-message:<old@example.com>", work["claim_resources"])
+                campaign.record_schedule_session(str(session), key=work["key"], result="skipped", claim_token=work["claim_token"])
+
+    def test_post_claim_batch_failure_preserves_previously_issued_work(self):
+        for prior_work in (False, True):
+            with self.subTest(prior_work=prior_work):
+                root = self.root / ("batch-" + str(prior_work))
+                root.mkdir()
+                manifest = test_campaign.CampaignTests().write_manifest(root)
+                value = json.loads(manifest.read_text())
+                value["campaign_id"] = root.name
+                template = value["messages"][0]
+                value["messages"] = [{**template, "key": "row-" + str(index),
+                    "subject": root.name + " subject " + str(index),
+                    "schedule_at": "2026-08-19T09:" + str(index * 10).zfill(2) + ":00+08:00"}
+                    for index in range(3)]
+                manifest.write_text(json.dumps(value))
+                queue = campaign.render_campaign(str(manifest), str(root / "render"))["queue_path"]
+                audit = self.missing()
+                audit["results"] = [{"key": row["key"], "status": "missing", "issues": []} for row in value["messages"]]
+                session = root / "session.json"
+                with mock.patch.object(campaign, "audit_campaign", return_value=audit):
+                    campaign.start_schedule_session(str(manifest), str(session), action="schedule", queue_path=queue)
+                    issued = campaign.next_session_operations(str(session), limit=1)["batch"][0] if prior_work else None
+                held = []
+
+                def fail_under_claims(*args, **kwargs):
+                    held.extend(operation_state.inspect_claim(root.name + ":" + row["key"])
+                                for row in value["messages"])
+                    raise OSError("batch audit failure")
+
+                with mock.patch.object(campaign, "audit_campaign", side_effect=[audit, None]) as observer:
+                    observer.side_effect = lambda *a, **kw: fail_under_claims() if kw.get("fresh") else audit
+                    with self.assertRaisesRegex(OSError, "batch audit failure"):
+                        campaign.next_session_operations(str(session))
+                self.assertEqual(len(held), 3)
+                self.assertTrue(all(held))
+                status = campaign.session_status(str(session))
+                self.assertEqual(set(status["active_claims"]), {"row-0"} if prior_work else set())
+                self.assertEqual(status["statuses"], {"claimed": 1, "pending": 2} if prior_work else {"pending": 3})
+                for claim in held:
+                    for resource in claim["resources"]:
+                        current = operation_state.inspect_claim(resource)
+                        if issued and claim["token"] == issued["claim_token"]:
+                            self.assertEqual(current["token"], issued["claim_token"])
+                        else:
+                            self.assertIsNone(current)
+
     def test_multi_claim_release_requires_token_and_releases_whole_group(self):
         self.assertTrue(operation_state.claim_many(["campaign", "intent", "message"], "owner", "token", "session"))
         operation_state.release("campaign", "incorrect")

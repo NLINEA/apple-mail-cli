@@ -74,6 +74,18 @@ Mail from `campaign next`: that command previews work but does not claim it.
 Old sessions can still be read/reconciled, but a new result record requires a
 claimed operation. Existing `applied_unverified` rows must be reconciled, not repeated.
 
+Before returning a non-empty batch, `session-next` audits Mail again while all
+new claims are held, bypassing the attachment evidence cache. This closes the
+window where another session finishes after the initial audit and releases its
+claim before this session acquires it. Changed state or Message-IDs, unsafe or
+incomplete evidence, and failed rechecks block the entire new batch. No Mail
+action has been handed out at that point, so only those newly acquired claims
+are released. Previously issued/in-flight claims remain unchanged. Reconcile
+and inspect the discrepancy before requesting more work; do not blindly retry.
+Claims do not prevent manual Mail edits or later synchronization changes. All
+workers must run the current patch; still verify the exact visible item before
+acting and reconcile after each batch.
+
 `blocked_claims` identifies the owning session when another campaign has already
 claimed the same identity. This is concurrent-operation protection, not permanent
 suppression of all future mail to that contact. Reschedule/cancel sessions pin
