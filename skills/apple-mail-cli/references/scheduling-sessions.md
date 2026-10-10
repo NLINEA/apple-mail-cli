@@ -26,16 +26,19 @@ attachments and obtain current-turn confirmation.
 ## Operate and record
 
 ```bash
-mailctl campaign session-next /private/render/session.json --limit 20
+mailctl campaign session-next /private/render/session.json --limit 20 --owner codex-current-task
 mailctl campaign session-record /private/render/session.json \
   --key row-0001 \
+  --claim-token UUID-FROM-SESSION-NEXT \
   --result applied
 mailctl campaign session-reconcile /private/render/session.json
 ```
 
-Operate only the returned batch. Record `failed` with a short `--note` when the
-screen locks, a picker value differs, Mail becomes unresponsive, or the visible
-item cannot be identified exactly. `skipped` is terminal and should be used
+Operate only the returned batch and retain its ownership token. Record `failed`
+with a short `--note` only when you have confirmed that no change took effect.
+For timeouts, a locked screen, or other uncertain outcomes, keep the claim and
+audit first; never release it into a retry just because the UI stopped responding.
+`skipped` is terminal and should be used
 only for an intentional user-approved exclusion.
 
 `applied` becomes `applied_unverified`; it is not success. Reconciliation is
@@ -55,6 +58,27 @@ timeout or closed window cannot create a duplicate.
 
 Session files are private `0600` JSON, bound to the exact manifest SHA-256, and
 updated atomically. `session-next` can be called after a restart; it first
-reconciles verified state, then returns only pending, failed, or
-verification-failed operations. A changed or missing manifest invalidates the
-session rather than silently continuing.
+reconciles verified state, then claims only safe pending or confirmed-failed
+operations. Verification failures block the batch. Recipient, sender,
+attachment, duplicate or replica conflicts also block it. The manifest, actual
+queue fields (including BCC), and rendered EML bytes are rechecked on every resume.
+
+Claims are private, cross-process locks shared across separate sessions. Version
+0.6 acquires the campaign/key, sender + exact To/CC/BCC + subject intent, and any
+observed Message-IDs together, independent of campaign name or requested time.
+A second agent cannot claim an active matching operation. Claims never
+expire into automatic retries. `session-status` exposes operations and active
+claim tokens for recovery, including a crash between broker and session writes.
+Audit actual Mail first, then record using the original token. Do not operate
+Mail from `campaign next`: that command previews work but does not claim it.
+Old sessions can still be read/reconciled, but a new result record requires a
+claimed operation. Existing `applied_unverified` rows must be reconciled, not repeated.
+
+`blocked_claims` identifies the owning session when another campaign has already
+claimed the same identity. This is concurrent-operation protection, not permanent
+suppression of all future mail to that contact. Reschedule/cancel sessions pin
+observed Message-IDs and stop if the target identity changes. New groups acquire
+locks in a fixed order; a crash during publication can leave conservative blocking
+claims. Group release requires the original token. Never delete a claim to force
+a retry. Upgrade/stop old workers before concurrent cross-campaign work: existing
+legacy single-resource claims retain only their original campaign/key coverage.

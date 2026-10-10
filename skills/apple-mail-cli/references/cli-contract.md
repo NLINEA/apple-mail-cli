@@ -24,7 +24,7 @@ boundaries. Run `mailctl --version` when exact implementation identity matters.
   resumable scheduling sessions and checkpoints, private triage JSON, private
   CSV, private event JSON, and an automatically invalidated private Send Later
   evidence cache.
-- Draft mutations: visible `compose` and `reply`; neither sends.
+- Draft mutations: visible `compose`, `reply`, and revision-guarded `draft update`; none sends.
 - Confirmed Mail mutations: `mark`, `flag`, `move`, `trash`, and direct `send`.
 - UBD read-only: capabilities and scoped work reads.
 - UBD proposal-only: a stored campaign or classification proposal that still
@@ -46,7 +46,8 @@ mismatch is `wrong_attachment`.
 Unchanged `.emlx` evidence may be reused from a `0600` cache under the user's
 local cache directory. Cache keys contain an opaque SHA-256 path token rather
 than a local message path; entries are bound to device, inode, file size, and
-nanosecond modification time. A changed file is reparsed before it can be
+nanosecond modification/change times with a 15-minute evidence TTL. `--fresh`
+bypasses reuse. A changed file is reparsed before it can be
 trusted. The cache is bounded, atomically replaced, and never written into
 Apple Mail's directories.
 
@@ -54,6 +55,16 @@ Apple Mail's directories.
 action only. The operation remains `applied_unverified` until
 `session-reconcile` observes the exact expected state in Sent or Send Later.
 Session files are bound to the exact manifest digest and updated atomically.
+`session-next` claims work across processes/sessions; `session-record` requires
+its ownership token. Claims do not auto-expire, and unsafe audit results block
+continuation. `session-status` is the private recovery view.
+
+Version 0.6 adds cross-campaign intent and Message-ID claim resources, with fixed
+lock order and token-bound group release. A crash can leave blocking partial
+claims; the campaign/key recovery anchor is published first. `blocked_claims`
+identifies conflicts. All workers must use 0.6 for cross-campaign guarantees;
+old active claims still protect only their legacy scope. Changed pinned Mail
+identity stops reschedule/cancel sessions.
 
 `campaign rebalance` always writes a separate manifest. It interprets allowed
 hours and daily counts in `policy.timezone`, counts account-wide Sent and Send
@@ -66,6 +77,13 @@ slots, and moves only rows that do not fit the requested window or policy.
 - `trash`: requires `--confirm-trash`.
 - `send`: previews offline by default; requires `--confirm-send SHA256` after the current conversation has shown
   the exact To/CC/BCC, sender, subject, body, and attachment evidence.
+- `send` requires an explicit `--sender`, reads the created draft back, and
+  guards its snapshot again before asking Mail to send. Missing evidence blocks
+  sending. Draft verification concerns observable fields and referenced files,
+  not server delivery. Acceptance returns `submission_accepted: true`,
+  `delivery_confirmed: false`, and the confirmed `intent_digest`.
+- `draft update`: a full field replacement gated by `--expected-revision` from
+  `draft show` and `--confirm-change`; it remains unsent even if verification fails.
 - `ubd propose-*`: requires `--confirm-proposal`, exact business-unit/work UUIDs,
   positive current revision, and a UUID idempotency key.
 - A draft request never authorizes `send`; a UBD proposal never authorizes a
@@ -73,6 +91,30 @@ slots, and moves only rows that do not fit the requested window or policy.
 
 These flags are execution gates, not substitutes for current-turn user
 authorization.
+
+`campaign render --force` is an owned-artifact replacement, never blanket EML
+cleanup. New files are staged, previous owned artifacts receive a private backup,
+and unrelated/stale files remain. Caught publication failures roll back; hard
+interruptions still require checking queue/checkpoint integrity before recovery.
+
+Triage message failures produce a partial structured result with `ok: false`
+and exit 1, retaining successful `items` and recording `errors`. A partial
+`--output` artifact remains private and is rejected as dashboard input.
+Permission or automation timeout stops additional reads, preserving completed
+results. `complete` covers only the selected batch; `truncated` remains separate.
+
+`read-batch` and triage group up to 20 messages per backend call (up to 100 selected
+IDs overall). `--batch-size 1` uses the single-message path. Responses must account
+for every requested ID exactly once as success, error or explicitly not attempted.
+Whole-call timeout yields no recoverable intermediate bodies for that chunk;
+previous chunks remain available. There is no automatic retry.
+
+`receipt-reconcile` is Mail-read-only but annotates the private receipt. A positive
+`sent_observed` is account/Message-ID metadata matching, not full integrity or
+delivery verification. Dispatch state remains unchanged. `campaign followups`
+is a local human-review worklist, optionally saved privately; it never contacts
+recipients or creates UBD work. Read [post-send-and-followups.md](post-send-and-followups.md)
+before interpreting either command.
 
 ## Privacy and credentials
 
@@ -198,6 +240,35 @@ arguments, stored in artifacts, sent through proxies, or forwarded through
 HTTP redirects. HTTPS is mandatory except for localhost contract tests.
 
 ## Cross-agent invocation
+
+All command results and runtime errors include version, schema and observation
+time. `--help`/`--version` and parser usage errors remain ordinary CLI text.
+`mark`/`flag` read back the modified field; move/trash report accepted but
+unverified. Independently inspect destination state before claiming completion.
+
+Mail mutations accept a caller-supplied stable `--operation-id` UUID. Private
+0600 receipts persist request fingerprints and outcomes before/after dispatch.
+Identical completed requests replay their receipts; uncertain or in-flight Mail
+mutations never retry automatically. `receipt UUID` reads the journal.
+If omitted, a UUID is generated and returned; callers needing crash recovery
+must supply and retain their own ID before invoking the command.
+The default state directory is `~/Library/Application Support/apple-mail-cli`.
+`MAILCTL_STATE_DIR` is only for isolated tests; every production agent must use
+the same directory or ownership/idempotency protection cannot span agents.
+Receipts can contain private draft text/metadata or existing UBD work detail;
+unlike redacted events, they must never be published or passed to UBD.
+
+`ubd retry-proposal UUID --confirm-proposal` replays the exact persisted request
+to the same validated origin with the same key, after a fresh capability check.
+The server still checks its saved expected work revision and human-review gate.
+It is safe against a changed observation timestamp; it does not regenerate the
+proposal. Completed receipts are returned without another submission.
+
+`attachments save` writes to a private temporary sibling and exclusively creates
+the requested output. It reports actual saved bytes and SHA-256; Mail's reported
+attachment size is approximate, not an integrity guarantee.
+
+## Shared installation
 
 Both Codex and Hermes should invoke the same installed `mailctl` command. The
 plugin source remains the single implementation; the Hermes configuration

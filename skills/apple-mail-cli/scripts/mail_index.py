@@ -8,11 +8,12 @@ import hashlib
 import json
 import time
 import unicodedata
+import math
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlparse
 
 
 class MailIndexError(RuntimeError):
@@ -202,6 +203,7 @@ def normalize_row(row: sqlite3.Row) -> dict[str, Any]:
         "summary": row_value(row, "summary", "") or "",
         "state": mailbox_state(row["mailbox_url"]),
         "mailbox_url": row["mailbox_url"],
+        "account_key": urlparse(row["mailbox_url"] or "").netloc,
         "scheduled_at": iso_epoch(row["send_later_epoch"]),
         "date_sent": iso_epoch(row["date_sent_epoch"]),
         "date_received": iso_epoch(row["date_received_epoch"]),
@@ -270,18 +272,18 @@ def _cursor_digest(filters: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
 
 
-def encode_cursor(offset: int, filters: dict[str, Any]) -> str:
+def encode_cursor(anchor: list[int | float], filters: dict[str, Any]) -> str:
     payload = json.dumps(
-        {"v": SEARCH_CURSOR_VERSION, "offset": offset, "query": _cursor_digest(filters)},
+        {"v": SEARCH_CURSOR_VERSION, "after": anchor, "query": _cursor_digest(filters)},
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def decode_cursor(value: str | None, filters: dict[str, Any]) -> int:
+def decode_cursor(value: str | None, filters: dict[str, Any]) -> list | None:
     if not value:
-        return 0
+        return None
     if len(value) > MAX_CURSOR_CHARS:
         raise MailIndexError("Search cursor is invalid.")
     try:
@@ -293,11 +295,12 @@ def decode_cursor(value: str | None, filters: dict[str, Any]) -> int:
         not isinstance(payload, dict)
         or payload.get("v") != SEARCH_CURSOR_VERSION
         or payload.get("query") != _cursor_digest(filters)
-        or type(payload.get("offset")) is not int
-        or not 0 <= payload["offset"] <= 2**63 - 1
+        or not isinstance(payload.get("after"), list)
+        or len(payload["after"]) != 2
+        or any(type(part) not in {int, float} or not math.isfinite(part) for part in payload["after"])
     ):
         raise MailIndexError("Search cursor does not match this query.")
-    return payload["offset"]
+    return payload["after"]
 
 
 def search_messages(
@@ -318,6 +321,9 @@ def search_messages(
     limit: int = 100,
     cursor: str | None = None,
     chronological: bool = False,
+    account: str | None = None,
+    exact_address: bool = False,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     """Search the complete metadata index without reading message bodies."""
     path = find_index(database)
@@ -340,22 +346,39 @@ def search_messages(
         "before": before,
         "conversation_id": conversation_id,
         "chronological": chronological,
+        "account": account,
+        "exact_address": exact_address,
+        "message_id": message_id,
     }
-    offset = decode_cursor(cursor, filters)
+    anchor = decode_cursor(cursor, filters)
     page_limit = max(1, min(int(limit), 1000))
     where: list[str] = []
     params: list[Any] = []
+    where.append("coalesce(m.deleted, 0) = 0")
+    if account:
+        where.append("mb.url LIKE ? ESCAPE '\\'")
+        escaped = account.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%://{escaped}/%")
+    if message_id:
+        where.append("g.message_id_header = ?")
+        params.append(message_id)
     if state_values:
         where.append("mailctl_mailbox_state(mb.url) IN (" + ",".join("?" for _ in state_values) + ")")
         params.extend(state_values)
     if filters["sender"]:
-        where.append(contains_sql("sv.addresses"))
-        params.append(filters["sender"])
+        if exact_address:
+            where.append("EXISTS (SELECT 1 FROM sender_addresses xs JOIN addresses xa ON xa.ROWID = xs.address WHERE xs.sender = m.sender AND mailctl_casefold(xa.address) = ?)")
+            params.append(filters["sender"])
+        else:
+            where.append(contains_sql("sv.addresses"))
+            params.append(filters["sender"])
     if filters["recipient"]:
-        where.append(
-            contains_sql("coalesce(tr.addresses, '') || char(31) || coalesce(cr.addresses, '') || char(31) || coalesce(br.addresses, '')")
-        )
-        params.append(filters["recipient"])
+        if exact_address:
+            where.append("EXISTS (SELECT 1 FROM recipients xr JOIN addresses xa ON xa.ROWID = xr.address WHERE xr.message = m.ROWID AND mailctl_casefold(xa.address) = ?)")
+            params.append(filters["recipient"])
+        else:
+            where.append(contains_sql("coalesce(tr.addresses, '') || char(31) || coalesce(cr.addresses, '') || char(31) || coalesce(br.addresses, '')"))
+            params.append(filters["recipient"])
     if filters["subject"]:
         where.append(contains_sql("s.subject"))
         params.append(filters["subject"])
@@ -376,6 +399,10 @@ def search_messages(
         where.append("m.conversation_id = ?")
         params.append(int(conversation_id))
     timestamp_expression = "max(coalesce(g.send_later_date, 0), coalesce(m.date_sent, 0), coalesce(m.date_received, 0))"
+    if anchor is not None:
+        comparison = ">" if chronological else "<"
+        where.append(f"({timestamp_expression} {comparison} ? OR ({timestamp_expression} = ? AND m.ROWID {comparison} ?))")
+        params.extend([anchor[0], anchor[0], anchor[1]])
     since_epoch = parse_iso_epoch(since, "since")
     before_epoch = parse_iso_epoch(before, "before")
     if since_epoch is not None:
@@ -392,8 +419,8 @@ def search_messages(
     if where:
         sql += " WHERE " + " AND ".join(where)
     direction = "ASC" if chronological else "DESC"
-    sql += f" ORDER BY {timestamp_expression} {direction}, m.ROWID {direction} LIMIT ? OFFSET ?"
-    params.extend([page_limit + 1, offset])
+    sql += f" ORDER BY {timestamp_expression} {direction}, m.ROWID {direction} LIMIT ?"
+    params.append(page_limit + 1)
     try:
         with connect_read_only(path) as connection:
             fetched = connection.execute(sql, params).fetchall()
@@ -406,7 +433,7 @@ def search_messages(
         "messages": rows,
         "returned": len(rows),
         "has_more": has_more,
-        "next_cursor": encode_cursor(offset + len(rows), filters) if has_more else None,
+        "next_cursor": encode_cursor([max(fetched[page_limit - 1][key] or 0 for key in ("send_later_epoch", "date_sent_epoch", "date_received_epoch")), fetched[page_limit - 1]["row_id"]], filters) if has_more else None,
         "body_searched": False,
     }
 
@@ -465,6 +492,7 @@ def schema_report(database: str | None = None) -> dict[str, Any]:
 
 def unique_messages(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
+    grouped: dict[str, list[dict]] = {}
     rank = {"sent": 5, "scheduled": 4, "draft": 3, "outbox": 2, "inbox": 1, "other": 0, "trash": -1}
 
     def score(row: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
@@ -477,10 +505,25 @@ def unique_messages(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
     for row in rows:
         key = row["message_id"]
+        grouped.setdefault(key, []).append(row)
         current = selected.get(key)
         if current is None or score(row) > score(current):
             selected[key] = row
-    return [selected[key] for key in sorted(selected)]
+    output = []
+    for key in sorted(selected):
+        chosen = selected[key]
+        # Inbox/Sent replicas describe different lifecycle views; compare same-state evidence.
+        peers = [row for row in grouped[key] if row.get("state") == chosen.get("state")]
+        conflicts = []
+        for field in ("sender_addresses", "to", "cc", "bcc", "attachments", "scheduled_at"):
+            values = {json.dumps(sorted(row[field]) if isinstance(row[field], list) else row[field], sort_keys=True)
+                      for row in peers if field in row and (row.get(field) or (field in {"cc", "bcc", "attachments"} and row.get("to") and row.get("sender_addresses")))}
+            if len(values) > 1:
+                conflicts.append(field)
+        if conflicts:
+            chosen = {**chosen, "replica_conflicts": conflicts}
+        output.append(chosen)
+    return output
 
 
 def counts(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:

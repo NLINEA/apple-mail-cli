@@ -156,8 +156,13 @@ class BackendContractTests(unittest.TestCase):
 
     def test_unexpected_failure_keeps_json_contract_without_private_detail(self):
         output = StringIO()
-        with mock.patch.object(mailctl.sys, "argv", ["mailctl", "capabilities"]), mock.patch.object(mailctl, "execute", side_effect=ValueError("synthetic private detail")), redirect_stdout(output):
+        with mock.patch.object(mailctl.sys, "argv", ["mailctl", "capabilities"]), mock.patch.object(mailctl, "execute", side_effect=RuntimeError("synthetic private detail")), redirect_stdout(output):
             self.assertEqual(mailctl.main(), 1)
         result = json.loads(output.getvalue())
         self.assertEqual(result["error"]["code"], "unexpected_error")
+        self.assertNotIn("synthetic private detail", result["error"]["message"])
+
+    def test_validation_failure_does_not_expose_private_detail(self):
+        result = mailctl.structured_error(ValueError("synthetic private detail"), "send")
+        self.assertEqual(result["error"]["code"], "validation_error")
         self.assertNotIn("synthetic private detail", result["error"]["message"])

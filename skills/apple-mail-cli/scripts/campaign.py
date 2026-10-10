@@ -10,7 +10,9 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
@@ -21,6 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mail_index import MailIndexError, list_messages, unique_messages
 from mail_store import load_send_later_evidence
+import operation_state
 
 
 EMAIL_PATTERN = re.compile(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$")
@@ -118,7 +121,11 @@ def write_private_json_atomic(path: Path, value: dict[str, Any], *, create_only:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if create_only:
+            os.link(temporary, path)
+            temporary.unlink()
+        else:
+            os.replace(temporary, path)
         path.chmod(0o600)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -193,7 +200,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_attachment(raw: Any, label: str, errors: list[str], warnings: list[str]) -> dict[str, Any] | None:
+def validate_attachment(raw: Any, label: str, errors: list[str], warnings: list[str], cache: dict | None = None) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         errors.append(f"{label}: attachment must be an object.")
         return None
@@ -210,7 +217,16 @@ def validate_attachment(raw: Any, label: str, errors: list[str], warnings: list[
     if CONTROL_PATTERN.search(actual_name):
         errors.append(f"{label}: filename contains control characters.")
         return None
-    actual_hash = sha256(path)
+    fingerprint = (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    actual_hash = (cache or {}).get(fingerprint)
+    if actual_hash is None:
+        actual_hash = sha256(path)
+        after = path.stat()
+        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != fingerprint[1:]:
+            errors.append(f"{label}: attachment changed while being read.")
+            return None
+        if cache is not None:
+            cache[fingerprint] = actual_hash
     expected_name = raw.get("name")
     expected_size = raw.get("size_bytes")
     expected_hash = str(raw.get("sha256") or "").lower()
@@ -236,7 +252,7 @@ def validate_attachment(raw: Any, label: str, errors: list[str], warnings: list[
 
 
 def message_attachments(
-    message: dict[str, Any], defaults: dict[str, Any], label: str, errors: list[str], warnings: list[str]
+    message: dict[str, Any], defaults: dict[str, Any], label: str, errors: list[str], warnings: list[str], cache: dict | None = None
 ) -> list[dict[str, Any]]:
     raw_values = message.get("attachments", defaults.get("attachments", []))
     if not isinstance(raw_values, list):
@@ -244,7 +260,7 @@ def message_attachments(
         return []
     result: list[dict[str, Any]] = []
     for index, raw in enumerate(raw_values):
-        evidence = validate_attachment(raw, f"{label}.attachments[{index}]", errors, warnings)
+        evidence = validate_attachment(raw, f"{label}.attachments[{index}]", errors, warnings, cache)
         if evidence:
             result.append(evidence)
     return result
@@ -288,6 +304,7 @@ def validate_manifest(
     skipped: list[dict[str, Any]] = []
     keys: set[str] = set()
     identities: set[tuple[tuple[str, ...], str]] = set()
+    attachment_cache: dict = {}
 
     for index, raw in enumerate(raw_messages):
         label = f"messages[{index}]"
@@ -318,7 +335,7 @@ def validate_manifest(
         if required_signature and required_signature not in body:
             errors.append(f"{label}.body is missing required signature text '{required_signature}'.")
         require_blank = bool(raw.get("require_blank_line_before_attachment", defaults.get("require_blank_line_before_attachment", False)))
-        attachments = message_attachments(raw, defaults, label, errors, warnings)
+        attachments = message_attachments(raw, defaults, label, errors, warnings, attachment_cache)
         if attachments and require_blank and not body.endswith("\n\n"):
             errors.append(f"{label}.body must end with a blank line before attachments.")
         schedule_at = parse_time(raw.get("schedule_at"), f"{label}.schedule_at", errors)
@@ -396,6 +413,8 @@ def validate_manifest(
     allowed_hours = policy.get("allowed_hours")
     if allowed_hours:
         try:
+            if not isinstance(allowed_hours, list) or len(allowed_hours) != 2 or not all(isinstance(v, str) for v in allowed_hours):
+                raise ValueError("Invalid allowed_hours shape")
             datetime.strptime(allowed_hours[0], "%H:%M").time()
             datetime.strptime(allowed_hours[1], "%H:%M").time()
             if enforce_schedule_policy:
@@ -459,18 +478,108 @@ def source_fingerprint(item: dict[str, Any]) -> str:
     )
 
 
+def prior_render_files(output: Path, campaign_id: str) -> list[Path]:
+    """Resolve only artifacts explicitly owned by a readable previous queue."""
+    queue_path, checkpoint_path = output / "queue.json", output / "checkpoint.json"
+    if not queue_path.exists() and not queue_path.is_symlink():
+        if checkpoint_path.exists() or checkpoint_path.is_symlink():
+            raise CampaignError("Cannot replace an orphan checkpoint without its owning queue; use a new directory.")
+        return []
+    for path in (queue_path, checkpoint_path):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_MANIFEST_BYTES:
+            raise CampaignError("Previous render metadata is missing, oversized, or a symlink; use a new directory.")
+    try:
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise CampaignError("Previous render metadata is unreadable; use a new directory.") from error
+    if (not isinstance(queue, dict) or not isinstance(checkpoint, dict)
+            or queue.get("schema_version") != QUEUE_SCHEMA_VERSION or checkpoint.get("schema_version") != QUEUE_SCHEMA_VERSION
+            or queue.get("campaign_id") != campaign_id or checkpoint.get("campaign_id") != campaign_id
+            or not isinstance(queue.get("messages"), list)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(queue.get("manifest_sha256") or ""))
+            or checkpoint.get("manifest_sha256") != queue["manifest_sha256"]):
+        raise CampaignError("Previous render does not belong to this campaign; use a new directory.")
+    owned = [queue_path, checkpoint_path]
+    for index, row in enumerate(queue["messages"]):
+        if not isinstance(row, dict) or not SAFE_IDENTIFIER_PATTERN.fullmatch(str(row.get("key") or "")):
+            raise CampaignError("Previous queue contains an invalid row; use a new directory.")
+        target = output / safe_filename(index, row["key"])
+        recorded = Path(str(row.get("eml_path") or "")).expanduser()
+        if recorded != target or target.is_symlink() or (target.exists() and not target.is_file()) or target in owned:
+            raise CampaignError("Previous queue has an unsafe or conflicting artifact path; use a new directory.")
+        if target.exists():
+            owned.append(target)
+    return owned
+
+
 def render_campaign(manifest_path: str, output_directory: str, *, force: bool = False) -> dict[str, Any]:
+    requested = Path(output_directory).expanduser()
+    if requested.is_symlink():
+        raise CampaignError("Render output must not be a symlink.")
+    output = requested.resolve()
+    # A directory-specific lock serializes competing CLI renderers; it lives outside the output.
+    with operation_state.locked(output):
+        return _render_campaign_locked(manifest_path, output, force=force)
+
+
+def _render_campaign_locked(manifest_path: str, output: Path, *, force: bool) -> dict[str, Any]:
+    manifest_digest = sha256(Path(manifest_path).expanduser().resolve())
     report = validate_manifest(manifest_path)
     require_valid(report)
-    output = Path(output_directory).expanduser().resolve()
     if output.exists() and any(output.iterdir()) and not force:
         raise CampaignError(f"Output directory is not empty: {output}. Pass --force to replace campaign render files.")
+    owned = prior_render_files(output, report["campaign_id"]) if output.exists() else []
+    new_names = [safe_filename(index, row["key"]) for index, row in enumerate(report["active_messages"])] + ["queue.json", "checkpoint.json"]
+    for name in new_names:
+        target = output / name
+        if target.is_symlink() or ((target.exists()) and target not in owned):
+            raise CampaignError(f"Refusing to overwrite an unowned artifact: {target}")
+    snapshots = {path: sha256(path) for path in owned}
+    with tempfile.TemporaryDirectory(prefix=".mailctl-render-", dir=output.parent) as temporary:
+        stage = Path(temporary)
+        result = render_staged_campaign(report, stage, output, manifest_digest)
+        if sha256(Path(report["manifest_path"])) != manifest_digest:
+            raise CampaignError("Manifest changed while rendering; previous artifacts are unchanged.")
+        for path, digest in snapshots.items():
+            if path.is_symlink() or not path.is_file() or sha256(path) != digest:
+                raise CampaignError("Previous render changed concurrently; no artifacts were replaced.")
+        output.mkdir(parents=True, exist_ok=True, mode=0o700)
+        output.chmod(0o700)
+        backup = Path(tempfile.mkdtemp(prefix=".mailctl-backup-", dir=output)) if owned else None
+        if backup:
+            for path in owned:
+                shutil.copy2(path, backup / path.name)
+                (backup / path.name).chmod(0o600)
+        published = []
+        try:
+            # Publish the queue last. Readers stop on any transient checkpoint/digest mismatch.
+            for name in [*new_names[:-2], "checkpoint.json", "queue.json"]:
+                target = output / name
+                if target in owned:
+                    if target.is_symlink() or sha256(target) != snapshots[target]:
+                        raise CampaignError("An owned artifact changed before publication; restoring the previous render.")
+                    os.replace(stage / name, target)
+                else:
+                    os.link(stage / name, target)  # Exclusive creation, never replace an unexpected file.
+                published.append(target)
+        except BaseException:
+            for target in reversed(published):
+                if target in owned:
+                    restore = stage / (target.name + ".restore")
+                    shutil.copy2(backup / target.name, restore)
+                    os.replace(restore, target)
+                else:
+                    target.unlink(missing_ok=True)
+            raise
+        result["backup_directory"] = str(backup) if backup else None
+        result["retained_unreferenced_eml"] = [str(path) for path in owned if path.suffix == ".eml" and path.name not in new_names]
+        return result
+
+
+def render_staged_campaign(report: dict, output: Path, destination: Path, manifest_digest: str) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     output.chmod(0o700)
-    if force:
-        for existing in output.iterdir():
-            if existing.is_file() and (existing.suffix == ".eml" or existing.name in {"queue.json", "checkpoint.json"}):
-                existing.unlink()
 
     queue: list[dict[str, Any]] = []
     for queue_index, item in enumerate(report["active_messages"]):
@@ -485,10 +594,13 @@ def render_campaign(manifest_path: str, output_directory: str, *, force: bool = 
         message.set_content(item["body"], subtype="plain", charset="utf-8")
         for attachment in item["attachments"]:
             attachment_path = Path(attachment["path"])
+            attachment_bytes = attachment_path.read_bytes()
+            if len(attachment_bytes) != attachment["size_bytes"] or hashlib.sha256(attachment_bytes).hexdigest() != attachment["sha256"]:
+                raise CampaignError(f"Attachment changed after validation: {attachment_path}")
             mime, _ = mimetypes.guess_type(attachment_path.name)
             maintype, subtype = (mime or "application/octet-stream").split("/", 1)
             message.add_attachment(
-                attachment_path.read_bytes(),
+                attachment_bytes,
                 maintype=maintype,
                 subtype=subtype,
                 filename=attachment["name"],
@@ -509,14 +621,13 @@ def render_campaign(manifest_path: str, output_directory: str, *, force: bool = 
                 "subject": item["subject"],
                 "schedule_at": item["schedule_at"],
                 "attachments": item["attachments"],
-                "eml_path": str(target),
+                "eml_path": str(destination / filename),
                 "eml_sha256": hashlib.sha256(rendered_bytes).hexdigest(),
                 "source_sha256": source_fingerprint(item),
             }
         )
     queue_path = output / "queue.json"
     checkpoint_path = output / "checkpoint.json"
-    manifest_digest = sha256(Path(report["manifest_path"]))
     write_private_json(
         queue_path,
         {
@@ -540,11 +651,11 @@ def render_campaign(manifest_path: str, output_directory: str, *, force: bool = 
     return {
         "ok": True,
         "campaign_id": report["campaign_id"],
-        "output_directory": str(output),
+        "output_directory": str(destination),
         "rendered": len(queue),
         "manifest_sha256": manifest_digest,
-        "queue_path": str(queue_path),
-        "checkpoint_path": str(checkpoint_path),
+        "queue_path": str(destination / "queue.json"),
+        "checkpoint_path": str(destination / "checkpoint.json"),
         "warnings": report["warnings"],
     }
 
@@ -577,23 +688,24 @@ def attachment_mismatch_fields(expected: list[dict[str, Any]], actual: list[dict
         fields.append("count")
     if Counter(str(item.get("name") or "") for item in expected) != Counter(str(item.get("name") or "") for item in actual):
         fields.append("filename")
-    if Counter(int(item.get("size_bytes") or 0) for item in expected) != Counter(int(item.get("size_bytes") or 0) for item in actual):
+    if Counter((str(item.get("name") or ""), int(item.get("size_bytes") or 0)) for item in expected) != Counter((str(item.get("name") or ""), int(item.get("size_bytes") or 0)) for item in actual):
         fields.append("size_bytes")
-    if Counter(str(item.get("sha256") or "").lower() for item in expected) != Counter(
-        str(item.get("sha256") or "").lower() for item in actual
+    if Counter((str(item.get("name") or ""), str(item.get("sha256") or "").lower()) for item in expected) != Counter(
+        (str(item.get("name") or ""), str(item.get("sha256") or "").lower()) for item in actual
     ):
         fields.append("sha256")
     return fields
 
 
-def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path: str | None = None) -> dict[str, Any]:
-    report = validate_manifest(manifest_path, enforce_schedule_policy=False)
+def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path: str | None = None, fresh: bool = False, _report: dict | None = None, _index_rows: tuple | None = None) -> dict[str, Any]:
+    report = _report or validate_manifest(manifest_path, enforce_schedule_policy=False)
     require_valid(report)
     # Unknown mailbox roles cannot prove delivery or absence. Keep matching
     # unknown-location copies visible so continuation fails closed.
-    index_path, raw_rows = list_messages(database=database, states={"sent", "scheduled", "other"}, limit=100000)
+    index_path, raw_rows = _index_rows or list_messages(database=database, states={"sent", "scheduled", "other"}, limit=100000)
     if len(raw_rows) >= 100_000:
         raise CampaignError("Mail index audit reached its 100,000-row safety bound; narrow or extend the audited adapter before scheduling.")
+    raw_rows = [row for row in raw_rows if not row.get("deleted")]
     rows = unique_messages(raw_rows)
     by_subject: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -677,6 +789,7 @@ def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path:
     local_report = load_send_later_evidence(
         send_later_ids,
         mail_version_root=mail_version_root(index_path),
+        fresh=fresh,
     )
     local_evidence = local_report["evidence"]
 
@@ -693,6 +806,8 @@ def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path:
             },
         }
         if chosen:
+            if chosen.get("replica_conflicts"):
+                result["issues"].append("replica_conflict")
             message_id = normalize_message_id(chosen["message_id"])
             fallback = local_evidence.get(message_id) if chosen.get("state") == "scheduled" else None
 
@@ -704,7 +819,7 @@ def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path:
             if not senders:
                 result["issues"].append("sender_unverified")
                 verification["sender"] = {"source": "unavailable", "status": "unverified"}
-            elif item["sender"].lower() not in senders:
+            elif senders != {item["sender"].lower()}:
                 result["issues"].append("wrong_sender")
                 verification["sender"] = {"source": sender_source, "status": "mismatched"}
             else:
@@ -750,6 +865,12 @@ def audit_campaign(manifest_path: str, *, database: str | None = None, csv_path:
                         "status": "mismatched",
                         "sha256_checked": False,
                         "mismatch_fields": mismatch_fields,
+                    }
+                elif item["attachments"]:
+                    result["issues"].append("attachment_unverified")
+                    verification["attachments"] = {
+                        "source": "mail_index", "status": "metadata_matched",
+                        "sha256_checked": False, "mismatch_fields": [],
                     }
                 else:
                     verification["attachments"] = {
@@ -832,13 +953,34 @@ def load_queue(path: str) -> tuple[Path, dict[str, Any]]:
     return queue_path, value
 
 
+def verify_queue(report: dict, queue_path: str) -> tuple[Path, dict]:
+    path, queue = load_queue(queue_path)
+    if queue.get("campaign_id") != report["campaign_id"] or queue.get("manifest_sha256") != sha256(Path(report["manifest_path"])):
+        raise CampaignError("Campaign manifest changed or rendered queue does not match; render a fresh queue.")
+    sources = {item["key"]: item for item in report["active_messages"]}
+    rows = {item["key"]: item for item in queue["messages"]}
+    if set(rows) != set(sources):
+        raise CampaignError("Rendered queue keys do not exactly match the manifest.")
+    for key, row in rows.items():
+        source = sources[key]
+        for field in ("sender", "to", "cc", "bcc", "subject", "schedule_at", "attachments", "company"):
+            if row.get(field) != source.get(field):
+                raise CampaignError(f"Rendered queue {field} differs from approved manifest for '{key}'.")
+        if row.get("source_sha256") != source_fingerprint(source):
+            raise CampaignError(f"Rendered queue source changed for '{key}'.")
+        eml = Path(str(row.get("eml_path") or "")).expanduser().resolve()
+        if eml.parent != path.parent or eml.suffix != ".eml" or not eml.is_file() or sha256(eml) != row.get("eml_sha256"):
+            raise CampaignError(f"Rendered EML integrity check failed for '{key}'.")
+    return path, queue
+
+
 def next_batch(manifest_path: str, queue_path: str, *, database: str | None = None, limit: int = 20) -> dict[str, Any]:
     report = validate_manifest(manifest_path)
     require_valid(report)
     audit = audit_campaign(manifest_path, database=database)
     if not audit["safe_to_resume_missing"]:
         raise CampaignError("Audit found duplicate, timing, recipient, sender, or attachment verification issues; resolve them before resuming.")
-    resolved_queue_path, queue = load_queue(queue_path)
+    resolved_queue_path, queue = verify_queue(report, queue_path)
     if queue.get("campaign_id") != audit["campaign_id"]:
         raise CampaignError("Rendered queue campaign_id does not match the manifest.")
     manifest_digest = sha256(Path(report["manifest_path"]))
@@ -905,6 +1047,8 @@ def next_batch(manifest_path: str, queue_path: str, *, database: str | None = No
 
 def schedule_change_plan(manifest_path: str, *, database: str | None = None, action: str) -> dict[str, Any]:
     audit = audit_campaign(manifest_path, database=database)
+    if any(row["status"] == "duplicate" or set(row.get("issues", [])) - {"wrong_time"} for row in audit["results"]):
+        raise CampaignError("Schedule change is blocked by recipient, sender, attachment, or replica conflicts.")
     if action == "cancel":
         selected = [item for item in audit["results"] if item["status"] in {"scheduled", "wrong_time"}]
     elif action == "reschedule":
@@ -955,6 +1099,8 @@ def load_triage_summary(path_value: str | None, recipients: set[str]) -> dict[st
     items = value.get("items") if isinstance(value, dict) else None
     if not isinstance(items, list):
         raise CampaignError("Triage artifact must contain an items array.")
+    if value.get("ok") is False or value.get("complete") is False or value.get("errors") or value.get("failed"):
+        raise CampaignError("Triage artifact has incomplete classification results; resolve failed messages before using it in a dashboard.")
     counts: Counter[str] = Counter()
     matched = 0
     for item in items:
@@ -979,9 +1125,10 @@ def campaign_dashboard(
 ) -> dict[str, Any]:
     report = validate_manifest(manifest_path, enforce_schedule_policy=False)
     require_valid(report)
-    audit = audit_campaign(manifest_path, database=database)
+    index_rows = list_messages(database=database, states={"sent", "scheduled", "other"}, limit=100000)
+    audit = audit_campaign(manifest_path, database=database, _report=report, _index_rows=index_rows)
     zone = policy_timezone(report["policy"])
-    index_path, raw_rows = list_messages(database=database, states={"sent", "scheduled"}, limit=100000)
+    index_path, raw_rows = index_rows
     if len(raw_rows) >= 100_000:
         raise CampaignError("Mail volume dashboard reached its 100,000-row safety bound.")
     recipients = {
@@ -1301,7 +1448,7 @@ def start_schedule_session(
         audit = audit_campaign(manifest_path, database=database)
         if not audit["safe_to_resume_missing"]:
             raise CampaignError("Campaign audit is unsafe; resolve issues before starting a schedule session.")
-        queue_file, queue = load_queue(queue_path)
+        queue_file, queue = verify_queue(report, queue_path)
         if queue.get("campaign_id") != report["campaign_id"] or queue.get("manifest_sha256") != sha256(Path(report["manifest_path"])):
             raise CampaignError("Rendered queue does not match the campaign manifest.")
         queue_by_key = {item["key"]: item for item in queue["messages"]}
@@ -1350,6 +1497,7 @@ def start_schedule_session(
                     "company": item.get("company"),
                     "subject": item.get("subject"),
                     "current_schedule": (item.get("matches") or [{}])[0].get("scheduled_at"),
+                    "message_ids": item.get("distinct_message_ids", []),
                     "target_schedule": item.get("expected_schedule") if action == "reschedule" else None,
                     "status": "pending",
                     "attempts": 0,
@@ -1373,11 +1521,23 @@ def start_schedule_session(
     return {"ok": True, "session": str(output), **session_status(str(output))}
 
 
-def reconcile_schedule_session(path_value: str, *, database: str | None = None) -> dict[str, Any]:
+def _reconcile_schedule_session(path_value: str, *, database: str | None = None) -> dict[str, Any]:
     path, session = load_session(path_value)
     manifest = Path(str(session.get("manifest_path") or "")).expanduser().resolve()
     if not manifest.is_file() or sha256(manifest) != session.get("manifest_sha256"):
         raise CampaignError("Schedule session manifest changed or is missing.")
+    report = validate_manifest(str(manifest), enforce_schedule_policy=False)
+    require_valid(report)
+    keys = [op.get("key") for op in session["operations"]]
+    sources = {item["key"]: item for item in report["active_messages"]}
+    if len(keys) != len(set(keys)) or set(keys) - set(sources):
+        raise CampaignError("Session keys differ from the approved manifest.")
+    if session["action"] == "schedule":
+        _, queue = verify_queue(report, str(session.get("queue_path") or ""))
+        emls = {row["key"]: row["eml_path"] for row in queue["messages"]}
+        for op in session["operations"]:
+            if op.get("eml_path") != emls[op["key"]]:
+                raise CampaignError("Session EML path changed after approval.")
     audit = audit_campaign(str(manifest), database=database)
     by_key = {item["key"]: item for item in audit["results"]}
     changed = 0
@@ -1386,11 +1546,19 @@ def reconcile_schedule_session(path_value: str, *, database: str | None = None) 
         if not result:
             continue
         previous = operation.get("status")
+        pinned = operation.get("message_ids")
+        observed = result.get("distinct_message_ids", [])
+        if pinned and observed and set(pinned) != set(observed):
+            result["issues"].append("message_identity_changed")
+            operation["status"] = "verification_failed"
+            operation["verification_issues"] = ["message_identity_changed"]
+            changed += previous != "verification_failed"
+            continue
         if session["action"] in {"schedule", "reschedule"}:
             if result["status"] in {"scheduled", "sent"} and not result["issues"]:
                 operation["status"] = "verified"
                 operation["verified_state"] = result["status"]
-            elif previous == "applied_unverified" and (result["status"] == "wrong_time" or result["issues"]):
+            elif previous in {"applied_unverified", "verified"} and (result["status"] in {"wrong_time", "duplicate"} or result["issues"] or previous == "verified"):
                 operation["status"] = "verification_failed"
                 operation["verification_issues"] = result["issues"] or [result["status"]]
         elif session["action"] == "cancel" and previous == "applied_unverified":
@@ -1402,10 +1570,17 @@ def reconcile_schedule_session(path_value: str, *, database: str | None = None) 
                 operation["verification_issues"] = ["sent_before_cancel"]
         if operation.get("status") != previous:
             changed += 1
+        if operation.get("status") == "verified" and operation.get("claim_token"):
+            operation_state.release(f"{session['campaign_id']}:{operation['key']}", operation["claim_token"])
     session["updated_at"] = datetime.now(timezone.utc).isoformat()
     session["last_audit"] = audit["summary"]
     write_private_json_atomic(path, session)
     return {"changed": changed, "audit": audit}
+
+
+def reconcile_schedule_session(path_value: str, *, database: str | None = None) -> dict[str, Any]:
+    with operation_state.locked(Path(path_value).expanduser().resolve()):
+        return _reconcile_schedule_session(path_value, database=database)
 
 
 def record_schedule_session(
@@ -1414,7 +1589,13 @@ def record_schedule_session(
     key: str,
     result: str,
     note: str | None = None,
+    claim_token: str | None = None,
 ) -> dict[str, Any]:
+    with operation_state.locked(Path(path_value).expanduser().resolve()):
+        return _record_schedule_session(path_value, key=key, result=result, note=note, claim_token=claim_token)
+
+
+def _record_schedule_session(path_value: str, *, key: str, result: str, note: str | None, claim_token: str | None) -> dict[str, Any]:
     if result not in {"applied", "failed", "skipped"}:
         raise CampaignError("Session result must be applied, failed, or skipped.")
     path, session = load_session(path_value)
@@ -1422,6 +1603,13 @@ def record_schedule_session(
     if len(matches) != 1:
         raise CampaignError(f"Schedule session does not contain exactly one operation for '{key}'.")
     operation = matches[0]
+    broker = operation_state.inspect_claim(f"{session['campaign_id']}:{key}")
+    # Recover an interrupted claim write, without reissuing a UI operation.
+    if (operation.get("status") in {"pending", "failed"} and broker and broker.get("token") == claim_token
+            and broker.get("session") == str(path)):
+        operation.update(status="claimed", claim_token=claim_token, owner=broker["owner"])
+    if not claim_token or operation.get("claim_token") != claim_token or operation.get("status") not in {"claimed", "applied_unverified"}:
+        raise CampaignError("Recording requires the claim_token returned by session-next for this operation.")
     operation["attempts"] = int(operation.get("attempts") or 0) + 1
     operation["status"] = "applied_unverified" if result == "applied" else result
     operation["last_note"] = (note or "")[:1000] or None
@@ -1429,6 +1617,8 @@ def record_schedule_session(
     session["events"].append({"key": key, "result": result, "observed_at": observed, "note": operation["last_note"]})
     session["updated_at"] = observed
     write_private_json_atomic(path, session)
+    if result in {"failed", "skipped"}:
+        operation_state.release(f"{session['campaign_id']}:{key}", claim_token)
     return {"ok": True, "session": str(path), "operation": operation}
 
 
@@ -1447,6 +1637,9 @@ def session_status(path_value: str) -> dict[str, Any]:
         "complete": complete,
         "updated_at": session.get("updated_at"),
         "last_audit": session.get("last_audit"),
+        "operations": session["operations"],
+        "active_claims": {item["key"]: claim for item in session["operations"]
+                          if (claim := operation_state.inspect_claim(f"{session['campaign_id']}:{item['key']}"))},
     }
 
 
@@ -1455,19 +1648,63 @@ def next_session_operations(
     *,
     database: str | None = None,
     limit: int = 20,
+    owner: str = "mailctl",
 ) -> dict[str, Any]:
-    reconcile_schedule_session(path_value, database=database)
-    path, session = load_session(path_value)
-    batch_limit = max(1, min(int(limit), 100))
-    actionable = [
-        item
-        for item in session["operations"]
-        if item.get("status") in {"pending", "failed", "verification_failed"}
-    ]
-    return {
-        **session_status(str(path)),
-        "remaining_actionable": len(actionable),
-        "batch_size": min(len(actionable), batch_limit),
-        "batch": actionable[:batch_limit],
-        "instruction": "Operate only these exact items in Mail's visible UI, record each result, then reconcile again.",
-    }
+    with operation_state.locked(Path(path_value).expanduser().resolve()):
+        reconciled = _reconcile_schedule_session(path_value, database=database)
+        path, session = load_session(path_value)
+        audit = reconciled["audit"]
+        allowed = {"wrong_time"} if session["action"] in {"reschedule", "cancel"} else set()
+        if any(row["status"] == "duplicate" or set(row.get("issues", [])) - allowed for row in audit["results"]):
+            raise CampaignError("Latest Mail evidence blocks this session; inspect campaign explain before continuing.")
+        if any(op["status"] == "verification_failed" for op in session["operations"]):
+            raise CampaignError("A previous operation failed verification; reconcile the discrepancy before continuing.")
+        sources = {item["key"]: item for item in validate_manifest(session["manifest_path"], enforce_schedule_policy=False)["active_messages"]}
+        results = {row["key"]: row for row in audit["results"]}
+        actionable = [op for op in session["operations"] if op["status"] in {"pending", "failed"}]
+        batch = []
+        blocked = []
+        for op in actionable:
+            expected_states = {"missing"} if session["action"] == "schedule" else {"scheduled", "wrong_time"}
+            if results[op["key"]]["status"] not in expected_states:
+                continue
+            token = str(uuid.uuid4())
+            source = sources[op["key"]]
+            # Intentionally exclude campaign name, row key, body and time: these
+            # can differ between two agents trying to operate on the same mail.
+            identity = {key: sorted(value.lower() for value in source[key]) for key in ("to", "cc", "bcc")}
+            identity.update(sender=source["sender"].lower(), subject=source["subject"])
+            resources = [f"{session['campaign_id']}:{op['key']}", "mail-intent:" + operation_state.digest(identity)]
+            message_ids = results[op["key"]].get("distinct_message_ids", [])
+            resources.extend("mail-message:" + normalize_message_id(value) for value in message_ids)
+            if not operation_state.claim_many(resources, owner[:120], token, str(path)):
+                conflicts = [claim for resource in resources if (claim := operation_state.inspect_claim(resource))]
+                blocked.append({"key": op["key"], "reason": "shared_mail_identity_claimed",
+                                "owners": sorted({claim["owner"] for claim in conflicts}),
+                                "sessions": sorted({claim["session"] for claim in conflicts})})
+                continue
+            op.update(status="claimed", claim_token=token, owner=owner[:120], claimed_at=operation_state.now(),
+                      claim_resources=resources, message_ids=message_ids)
+            batch.append({**op, **{k: source[k] for k in ("to", "cc", "bcc", "sender", "subject", "attachments")},
+                          "target_schedule": source["schedule_at"] if session["action"] != "cancel" else None,
+                          "message_ids": results[op["key"]].get("distinct_message_ids", [])})
+            if len(batch) >= max(1, min(int(limit), 100)):
+                break
+        write_private_json_atomic(path, session)
+        return {**session_status(str(path)), "remaining_actionable": len(actionable), "batch_size": len(batch), "batch": batch, "blocked_claims": blocked,
+                "instruction": "Use each claim_token with session-record. Claims never expire into automatic retries; audit uncertain operations first."}
+
+
+def campaign_diff(before: str, after: str) -> dict:
+    reports = [validate_manifest(value, enforce_schedule_policy=False) for value in (before, after)]
+    for report in reports:
+        require_valid(report)
+    old, new = ({row["key"]: row for row in report["active_messages"]} for report in reports)
+    changes = []
+    for key in sorted(set(old) | set(new)):
+        fields = {field: {"before": old.get(key, {}).get(field), "after": new.get(key, {}).get(field)}
+                  for field in ("sender", "to", "cc", "bcc", "subject", "body", "schedule_at", "attachments")
+                  if old.get(key, {}).get(field) != new.get(key, {}).get(field)}
+        if fields:
+            changes.append({"key": key, "change": "added" if key not in old else "removed" if key not in new else "updated", "fields": fields})
+    return {"ok": True, "changes": changes, "changed": len(changes), "before": reports[0]["summary"], "after": reports[1]["summary"]}

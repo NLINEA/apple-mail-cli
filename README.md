@@ -28,11 +28,12 @@ to itself; add its `scripts` directory to PATH instead of symlinking the launche
 alone. `MAILCTL_PYTHON` can select an existing Python executable. Core use does
 not require Codex or Hermes. Their plugin/skill configuration is optional.
 
-Maintained by **NLINEA**. Version **0.4.3 is experimental**. Independent review
-passed the bounded source/synthetic scope: 83 Python tests passed, one live
-test was skipped, and 40 fake JXA checks, four native protocol fixtures and
-10 additional review scenarios passed. Actual Mail draft/send, attachment
-readback, delivery and Send Later behavior have not been certified. See
+Maintained by **NLINEA**. Current version **0.6.0 is experimental**. This update
+integrates the local 0.5/0.6 features while retaining the public 0.4.3
+digest-confirmed send guard. The earlier independent review covers only 0.4.3,
+not this integration. See [CHANGELOG.md](CHANGELOG.md) for migration notes.
+Actual Mail draft/send, attachment readback, delivery and Send Later behavior
+have not been certified. See
 [VALIDATION.md](VALIDATION.md) for the measured platform and exact limits.
 Read [the CLI contract](skills/apple-mail-cli/references/cli-contract.md) and
 [SECURITY.md](SECURITY.md) before connecting an agent or enabling mutations.
@@ -49,8 +50,10 @@ mailctl doctor
 
 `capabilities` is offline. `doctor` checks macOS, the JXA backend and read-only
 Envelope Index access/schema without reading message bodies. Its backend ping
-does not prove Automation permission or connectivity to a mail provider. A
-missing or inaccessible index makes `doctor` fail.
+does not prove connectivity to a mail provider. Doctor also reads the account
+count through Mail to probe Automation; this may start Mail or show a permission
+prompt. Do not use doctor as an offline/no-prompt check. A missing or
+inaccessible index makes `doctor` fail.
 
 Index commands need existing Full Disk Access for the launching app/runtime.
 JXA Mail commands need Automation permission. Visible Send Later operations
@@ -74,21 +77,31 @@ and filters. A changing Mail index is not a frozen pagination snapshot.
 ## What it covers
 
 - bounded inbox, mailbox, selection, and message reads;
+- grouped reads (up to 20 messages per backend call) with explicit partial results;
 - complete metadata-index search with opaque pagination and conversation views;
 - reply, bounce, auto-reply, and DMARC classification;
 - bounded bilingual triage for opt-outs, complaints, out-of-office messages,
   and positive, negative, or question-bearing human replies;
 - visible drafts and replies, plus explicitly confirmed direct sending from an
   explicit configured sender;
+- draft show/verify and revision-guarded full updates; exact Message-ID resolution;
+- attachment listing and non-overwriting private export with SHA-256;
+- durable operation receipts, guarded send readback, and accepted-versus-sent states;
 - read-only Sent and Send Later reconciliation by real Message-ID, with a
   local `.emlx` fallback for missing Send Later sender and attachment metadata;
 - private evidence caching to reuse repeated audit evidence, with
   file fingerprint invalidation whenever the underlying `.emlx` changes;
 - validated, privately rendered, integrity-bound campaign queues;
+- staged forced rebuilds with an exact artifact allowlist and a private previous-version backup;
+- per-message classification failures reported alongside successful results, without losing the batch;
 - timezone-correct, account-quota-aware campaign dashboards and minimal-move
   rebalance manifests;
 - resumable visible-UI scheduling, rescheduling, and cancellation sessions whose
   results are not trusted until a fresh read-only Mail audit verifies them;
+- shared cross-process work claims, campaign revision diff, and per-row explanations;
+- cross-campaign active identity claims and pinned Message-IDs for schedule changes;
+- exact-account/Message-ID Sent observations on send receipts, without claiming delivery;
+- private follow-up review worklists; no automatic contact, sending, or UBD work creation;
 - confirmed mailbox changes with backend enforcement;
 - redacted UBD OS audit, dashboard, and classification events plus
   revision-bound work proposals that still require human review.
@@ -126,17 +139,19 @@ visible, and distinct conflicting IDs block continuation. Send Later attachment
 matches require `.emlx` filename/size/hash evidence, including readable evidence
 of absence when no attachments are expected. Historical Sent checks remain
 metadata-only (`metadata_matched`, `sha256_checked: false`), and do not establish
-attachment bytes.
+attachment bytes. Since 0.5, metadata-only matches for expected attachments also
+raise `attachment_unverified` and keep the campaign audit incomplete.
 
 The index recognizes only explicit root mailbox aliases; custom paths such as
 `Projects/Sentiment` and `Projects/Sent` remain `other`. Campaign audit includes
 unknown-role metadata so a matching copy raises `mailbox_unverified` and blocks
 continuation. Provider/localized/nested role mappings require separate native
 validation. This conservative scan still stops at 100,000 rows. Required body
-access failures stop `read`, body-search, `classify` and `triage` instead of
-  returning a successful empty read. Empty readable content is valid.
+access failures stop `read`, body-search and `classify`. Triage retains successful
+items but returns an incomplete failure result; it never classifies an unreadable
+body as empty. Empty readable content is valid.
 
-## Direct-send migration in 0.4.3
+## Direct-send confirmation (preserved from 0.4.3)
 
 The old boolean `--confirm-send` no longer sends. With no confirmation, `send`
 prints the normalized sender and To/CC/BCC lists, exact subject/body, attachment
@@ -176,6 +191,27 @@ persist the final record leaves the intent blocked. Errors after invocation use
 `send_outcome_unknown` with `retryable: false`; a repeated confirmed intent uses
 `send_attempt_exists` before automation runs. Treat both as a stop for review.
 
+## Post-send and follow-up review
+
+```bash
+mailctl read-batch --mailbox INBOX --id 123 --id 456
+mailctl receipt-reconcile OPERATION-UUID \
+  --account-key ACCOUNT-KEY --message-id '<exact-id@example.com>'
+mailctl campaign followups campaign.json --account-key ACCOUNT-KEY \
+  --after-days 7 --output /private/path/followup-review.json
+```
+
+`receipt-reconcile` checks every matching Sent replica against the saved send
+intent and dispatch-time boundary. This is metadata observation only: body,
+attachment bytes, operation-to-message correlation and recipient delivery remain
+unverified. It never unlocks an uncertain send for retry. Old receipts without
+a saved intent need manual inspection.
+
+Follow-up worklists are review prompts, not approved outbound queues. A matching
+Mail conversation or later activity from a contact requires inspection; no
+observed reply in the local index is not proof of silence. See
+`skills/apple-mail-cli/references/post-send-and-followups.md` for the full boundary.
+
 ## High-volume campaign flow
 
 ```bash
@@ -209,10 +245,10 @@ SHA-256 instead of returning only a generic failure.
 
 ## Shared agent surface
 
-The implementation lives once under `skills/apple-mail-cli/scripts/`. Codex
-loads it from the personal plugin marketplace. Hermes loads the same skill
-directory through `skills.external_dirs`; the installed `mailctl` wrapper
-lets both agents call it from any working directory.
+The implementation lives under `skills/apple-mail-cli/scripts/`. Codex can load
+the plugin through a configured personal marketplace. Hermes can load the same
+skill directory through `skills.external_dirs`. Point every agent at one current
+installation; publishing source does not update existing installations.
 
 See:
 

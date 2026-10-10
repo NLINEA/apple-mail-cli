@@ -1,4 +1,45 @@
-# 0.4.3 validation record
+# 0.6.0 integration validation — 2026-10-10
+
+Status: **experimental**. This public-source update combines local 0.5/0.6
+development with the existing public 0.4.3 guard implementation. The earlier
+independent review below is historical; it does not cover this integration.
+
+| Check | Fresh result | Boundary |
+| --- | --- | --- |
+| Full Python suite | 166 passed; one opt-in live test skipped | Synthetic fixtures, mocked mutations and a local fake HTTP server |
+| Offline Python suite | 164 passed; one opt-in live test skipped | Excludes the two HTTP loopback tests |
+| Fake JXA logic | 47 checks passed | Fake Mail objects; includes draft BCC/body/attachment drift, sender checks before draft updates and legacy send bypass rejection |
+| Native Foundation/CommonCrypto protocol | Four cases passed | Real platform APIs against temporary synthetic state; Mail never loaded |
+| Syntax, launcher, JSON capabilities, skill structure, diff integrity | Passed | Public source and manifest report 0.6.0 |
+
+The direct-send workflow retains exact-digest preview confirmation, immutable
+attachment snapshots, durable intent reservations and backend claims. New
+operation receipts do not replace that guard. Tests also cover cross-campaign
+claims, pinned schedule targets, grouped partial reads, exact-account Sent
+observations, review-only follow-ups, render rollback and existing campaign
+review regressions. A historical Sent filename/count match remains labelled
+`metadata_matched`, but expected attachments without byte evidence now raise
+`attachment_unverified` and keep the audit incomplete.
+
+No real Mail message was read, created, sent, scheduled, moved or deleted in
+this integration run. No real UBD endpoint was called. Live doctor/account
+checks and opt-in Mail tests were not run. In particular, the new draft
+readback guard has only synthetic coverage; native Mail property availability,
+signature/body transformation and asynchronous attachment behavior may block
+it. This release does not certify native sends, queue persistence or delivery.
+Publishing it does not update any existing local installation.
+
+Reproduce with the commands in the historical record below, plus:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
+```
+
+Keep `APPLE_MAIL_CLI_LIVE_TESTS` unset for the synthetic full suite. The offline
+runner disables it regardless. Privacy pattern scans checked the publication
+tree; they are not a complete secret-detection or security certification.
+
+# Historical 0.4.3 validation record
 
 Status: **experimental**, with a passed independent review of the bounded
 source/synthetic scope. Validation performed on 2026-10-01 using macOS 26.6.2

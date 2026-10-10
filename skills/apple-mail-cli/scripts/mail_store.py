@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from email import policy
 from email.parser import BytesHeaderParser, BytesParser
 from email.utils import getaddresses
@@ -19,6 +20,7 @@ MAX_HEADER_BYTES = 1024 * 1024
 MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 CACHE_SCHEMA_VERSION = "apple-mail-cli-send-later-evidence/v1"
+MAX_CACHE_AGE_SECONDS = 900
 
 
 def normalize_message_id(value: Any) -> str:
@@ -85,6 +87,7 @@ def file_fingerprint(path: Path) -> dict[str, int]:
         "inode": int(stat.st_ino),
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
     }
 
 
@@ -135,7 +138,7 @@ def load_cache(path: Path | None) -> dict[str, dict[str, Any]]:
         if path.is_symlink() or not path.is_file() or cache_stat.st_size > MAX_CACHE_BYTES or cache_stat.st_mode & 0o077:
             return {}
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     entries = value.get("entries") if isinstance(value, dict) and value.get("schema_version") == CACHE_SCHEMA_VERSION else None
     if not isinstance(entries, dict) or len(entries) > MAX_SEND_LATER_FILES:
@@ -186,9 +189,12 @@ def cached_entry(value: Any, fingerprint: dict[str, int]) -> dict[str, Any] | No
         "message_id": message_id,
         "message_size": message_size,
     }
-    evidence = validated_evidence(value.get("evidence"))
+    checked_at = value.get("checked_at")
+    valid_age = isinstance(checked_at, (int, float)) and 0 <= time.time() - checked_at <= MAX_CACHE_AGE_SECONDS
+    evidence = validated_evidence(value.get("evidence")) if valid_age else None
     if evidence is not None:
         output["evidence"] = evidence
+        output["checked_at"] = checked_at
     return output
 
 
@@ -280,6 +286,7 @@ def load_send_later_evidence(
     *,
     mail_version_root: Path | None,
     cache_path: Path | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     requested = {normalize_message_id(value) for value in message_ids if normalize_message_id(value)}
     if not requested:
@@ -294,7 +301,7 @@ def load_send_later_evidence(
         return empty_report(requested, reason="send_later_store_unavailable")
 
     resolved_cache_path = cache_path or default_cache_path(mail_version_root)
-    previous_entries = load_cache(resolved_cache_path)
+    previous_entries = {} if fresh else load_cache(resolved_cache_path)
     current_entries: dict[str, dict[str, Any]] = {}
     matches: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     failures = 0
@@ -337,6 +344,13 @@ def load_send_later_evidence(
         path, entry = local_matches[0]
         cached = validated_evidence(entry.get("evidence"))
         if cached is not None:
+            try:
+                if file_fingerprint(path) != entry["fingerprint"]:
+                    failures += 1
+                    continue
+            except OSError:
+                failures += 1
+                continue
             evidence[message_id] = cached
             evidence_cache_hits += 1
             continue
@@ -346,6 +360,7 @@ def load_send_later_evidence(
                 raise ValueError("EMLX message changed during verification.")
             evidence[message_id] = parsed
             entry["evidence"] = parsed
+            entry["checked_at"] = time.time()
         except (OSError, ValueError):
             failures += 1
 

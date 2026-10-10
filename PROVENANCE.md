@@ -23,8 +23,13 @@ public tree.
 
 The independently reviewed 0.4.3 candidate was pinned to manifest SHA-256
 `6cfada84c8ed59c683271fe193b65f00ff29510b497a63adb88fecab3e95bf02`.
-This publication tree changes project metadata and documentation only; all
-runtime, test, skill and reference bytes remain identical to that candidate.
+The initial 0.4.3 publication changed project metadata and documentation only;
+its runtime, test, skill and reference bytes remained identical to that candidate.
+Version 0.6.0 integrates subsequent local development with the public 0.4.3
+baseline, preserving its digest confirmation, private attachment snapshots,
+backend claims, literal Unicode search and conservative mailbox-role checks.
+It changes runtime, tests and documentation and is not covered by that earlier
+independent review. Its fresh regression results are recorded separately.
 [VALIDATION.md](VALIDATION.md) records the tested scope and limits.
 
 Competitors were compared using their official source/documentation. Their

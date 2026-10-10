@@ -76,6 +76,24 @@ function syntheticSendPayload() {
   return { command: "send", sender: "sender@example.test", to: ["recipient@example.test"], cc: ["copy@example.test"], bcc: ["private-copy@example.test"], subject: "香港 café", body: "Final body\n\n", attachments: [] };
 }
 
+function outgoingFixture(properties, send) {
+  const values = { id: 99, ...properties }, outgoing = { send };
+  function collection(field) {
+    const items = [];
+    const getter = () => items;
+    getter.push = value => items.push({ [field]: () => value[field] });
+    return getter;
+  }
+  const attachments = collection("fileName");
+  for (const field of ["id", "sender", "subject", "content", "visible"]) {
+    const getter = () => values[field];
+    if (field === "content") getter.attachments = attachments;
+    Object.defineProperty(outgoing, field, { get: () => getter, set: value => { values[field] = value; } });
+  }
+  for (const field of ["toRecipients", "ccRecipients", "bccRecipients"]) outgoing[field] = collection("address");
+  return outgoing;
+}
+
 const ping = contextFor({ command: "ping", synthetic: "香港 café" });
 assert.equal(ping.run().ok, true);
 assert.equal(ping.calls(), 0);
@@ -85,7 +103,8 @@ for (const payload of ["invalid JSON", "null", "[]", { command: "unknown" },
                        { command: "send" }, { command: "send", confirm_send: "true" },
                        { command: "send", confirm_send: true },
                        { command: "trash" }, { command: "trash", confirm_trash: 1 },
-                       { command: "mark" }, { command: "flag" }, { command: "move" }]) {
+                       { command: "mark" }, { command: "flag" }, { command: "move" },
+                       { command: "send_draft", draft_id: 99, confirm_send: true }]) {
   const fake = contextFor(payload);
   assert.equal(fake.run().ok, false);
   assert.equal(fake.calls(), 0, "invalid or unconfirmed requests must not load Mail");
@@ -127,9 +146,8 @@ for (const accounts of [[], [account("Disabled", "sender@example.test", false)],
 for (const command of ["compose", "send"]) {
   let created = 0;
   let sends = 0;
-  const outgoing = { id: () => 99, toRecipients: [], ccRecipients: [], bccRecipients: [], send() { sends += 1; return true; } };
   const mail = { accounts: () => [account("Work", "sender@example.test")],
-                 OutgoingMessage() { created += 1; return outgoing; },
+                 OutgoingMessage(properties) { created += 1; return outgoingFixture(properties, () => { sends += 1; return true; }); },
                  outgoingMessages: [], ToRecipient: value => value };
   const payload = { command, sender: "sender@example.test", to: ["recipient@example.test"], cc: [], bcc: [], subject: "Synthetic", body: "合成", attachments: [] };
   const fake = contextFor(payload, mail);
@@ -139,6 +157,17 @@ for (const command of ["compose", "send"]) {
   assert.equal(created, 1);
   assert.equal(sends, command === "send" ? 1 : 0);
   assert.equal(command === "send" ? result.data.delivery_confirmed : result.data.sent, false);
+  checks += 1;
+}
+for (const accounts of [[], [account("Disabled", "sender@example.test", false)],
+                       [account("One", "sender@example.test"), account("Two", "sender@example.test")]]) {
+  const draft = outgoingFixture({sender: "sender@example.test", subject: "Original", content: "Body", visible: true}, () => { throw new Error("must not send"); });
+  const payload = { command: "draft_update", draft_id: 99, confirm_change: true,
+                    sender: "sender@example.test", subject: "Changed", body: "Changed", to: ["recipient@example.test"] };
+  const fake = contextFor(payload, { accounts: () => accounts, outgoingMessages: { byId: () => draft } });
+  payload.expected_snapshot = fake.ctx.draftSnapshot(draft);
+  assert.equal(fake.run().ok, false);
+  assert.equal(draft.subject(), "Original", "invalid or ambiguous sender must block updates before mutation");
   checks += 1;
 }
 for (const content of [() => { throw new Error("synthetic body access denied"); }, () => "", () => "香港 readable body"]) {
@@ -192,8 +221,9 @@ for (const defect of ["bytes", "size", "path", "record", "permissions"]) {
 for (const outcome of [true, false, "throw"]) {
   let sends = 0;
   const payload = syntheticSendPayload();
-  const outgoing = { toRecipients: [], ccRecipients: [], bccRecipients: [], content: { attachments: [] }, send() { sends += 1; if (outcome === "throw") throw new Error("synthetic partial-send error"); return outcome; } };
-  const mail = { accounts: () => [account("Work", "sender@example.test")], OutgoingMessage: () => outgoing, outgoingMessages: [], ToRecipient: value => value, CcRecipient: value => value, BccRecipient: value => value, Attachment: value => value };
+  const mail = { accounts: () => [account("Work", "sender@example.test")],
+    OutgoingMessage: properties => outgoingFixture(properties, () => { sends += 1; if (outcome === "throw") throw new Error("synthetic partial-send error"); return outcome; }),
+    outgoingMessages: [], ToRecipient: value => value, CcRecipient: value => value, BccRecipient: value => value, Attachment: value => value };
   const fake = contextFor(payload, mail);
   prepareSend(fake, payload, [{ name: "approved.pdf", bytes: Buffer.from("approved") }]);
   const first = fake.run();
@@ -206,6 +236,25 @@ for (const outcome of [true, false, "throw"]) {
   assert.equal(fake.run().ok, false, "raw backend replay must not reissue");
   assert.equal(sends, 1);
   assert.equal(fake.calls(), 1);
+  checks += 1;
+}
+for (const drift of ["bcc", "body", "attachment"]) {
+  let sends = 0, outgoing;
+  const payload = syntheticSendPayload();
+  const mail = { accounts: () => [account("Work", "sender@example.test")],
+    OutgoingMessage: properties => (outgoing = outgoingFixture(properties, () => { sends++; return true; })),
+    outgoingMessages: [], ToRecipient: value => value, CcRecipient: value => value,
+    BccRecipient: value => drift === "bcc" ? { address: "wrong@example.test" } : value,
+    Attachment: value => {
+      if (drift === "body") outgoing.content = "changed body";
+      return drift === "attachment" ? { fileName: "/wrong/snapshot.pdf" } : value;
+    }
+  };
+  const fake = contextFor(payload, mail);
+  prepareSend(fake, payload, [{ name: "approved.pdf", bytes: Buffer.from("approved") }]);
+  assert.equal(fake.run().ok, false, drift + " readback drift must fail closed");
+  assert.equal(sends, 0, "a mismatched draft must remain unsent");
+  assert.equal(fake.run().ok, false, "uncertain attempts cannot retry");
   checks += 1;
 }
 console.log(JSON.stringify({ synthetic_backend_checks: checks, ok: true, mail_loaded: false }));

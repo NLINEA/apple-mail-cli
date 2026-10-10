@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -19,6 +20,13 @@ import campaign  # noqa: E402
 
 
 class CampaignTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.dict(os.environ, {"MAILCTL_STATE_DIR": temporary.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def write_manifest(self, directory: Path, **message_overrides: object) -> Path:
         message = {
             "key": "row-0001",
@@ -429,8 +437,8 @@ class CampaignTests(unittest.TestCase):
                         "company": "Example Company",
                         "subject": "A complete subject",
                         "expected_schedule": "2026-08-19T09:00:00+08:00",
-                        "status": "scheduled",
-                        "issues": [],
+                        "status": "wrong_time",
+                        "issues": ["wrong_time"],
                         "matches": [{"scheduled_at": "2026-08-18T09:00:00+08:00", "state": "scheduled"}],
                     }
                 ],
@@ -438,11 +446,12 @@ class CampaignTests(unittest.TestCase):
             verified = {
                 **scheduled,
                 "summary": {"active": 1, "statuses": {"scheduled": 1}, "issues": {}},
-                "results": [{**scheduled["results"][0], "matches": [], "status": "scheduled"}],
+                "results": [{**scheduled["results"][0], "matches": [], "status": "scheduled", "issues": []}],
             }
             with mock.patch.object(campaign, "audit_campaign", return_value=scheduled):
                 campaign.start_schedule_session(str(manifest), str(session_path), action="reschedule")
-            campaign.record_schedule_session(str(session_path), key="row-0001", result="applied")
+                batch = campaign.next_session_operations(str(session_path))
+            campaign.record_schedule_session(str(session_path), key="row-0001", result="applied", claim_token=batch["batch"][0]["claim_token"])
             self.assertEqual(campaign.session_status(str(session_path))["statuses"], {"applied_unverified": 1})
             with mock.patch.object(campaign, "audit_campaign", return_value=verified):
                 campaign.reconcile_schedule_session(str(session_path))

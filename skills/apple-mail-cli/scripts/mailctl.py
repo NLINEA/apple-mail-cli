@@ -13,6 +13,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
+import tempfile
+from collections import Counter
+from urllib.parse import unquote, urlparse
+from email import policy as email_policy
+from email.parser import Parser
 from datetime import datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -23,9 +29,12 @@ import mail_index
 import mail_store
 import ubd_connector
 import send_guard
+import operation_state
+import batch_read
+import mail_workflow
 
 
-VERSION = "0.4.3"
+VERSION = "0.6.0"
 CLI_SCHEMA_VERSION = "apple-mail-cli/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 BACKEND = SCRIPT_DIR / "mail_backend.js"
@@ -84,6 +93,8 @@ def run_backend(payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         raise MailCtlError("Apple Mail returned invalid UTF-8.", code="backend_contract_error") from error
     if completed.returncode != 0:
         detail = completed.stderr.strip() or "Apple Mail automation failed."
+        if "-1712" in detail or "timed out" in detail.lower():
+            raise MailCtlError(detail, code="mail_automation_timeout", hint="Inspect Mail before retrying.")
         if "Not authorized" in detail or "-1743" in detail:
             detail += " Allow Codex or Terminal to control Mail in System Settings > Privacy & Security > Automation."
             raise MailCtlError(
@@ -119,6 +130,8 @@ def run_backend(payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         )
     if not result["ok"]:
         message = result["error"]["message"]
+        if "-1712" in message or "timed out" in message.lower():
+            raise MailCtlError(message, code="mail_automation_timeout", hint="Inspect Mail before retrying.")
         if "not authorized" in message.lower() or "-1743" in message:
             message += " Allow Codex or Terminal to control Mail in System Settings > Privacy & Security > Automation."
             raise MailCtlError(message, code="mail_permission_denied")
@@ -234,6 +247,76 @@ def outgoing_preflight(args: argparse.Namespace, command: str) -> tuple[dict[str
     return payload, evidence
 
 
+DRAFT_FIELDS = ("draft_id", "sender", "subject", "content", "to", "cc", "bcc", "attachments", "visible")
+
+
+def draft_snapshot(draft: dict) -> dict:
+    return {key: draft.get(key) for key in DRAFT_FIELDS}
+
+
+def draft_verification(draft: dict, expected: dict, attachments: list[dict]) -> dict:
+    mismatches = []
+    for field in ("to", "cc", "bcc"):
+        try:
+            if Counter(normalize_addresses(draft.get(field) or [], field)) != Counter(expected[field]):
+                mismatches.append(field)
+        except MailCtlError:
+            mismatches.append(field)
+    try:
+        actual_sender = normalize_address(draft.get("sender"), "sender")
+        if not expected.get("sender") or actual_sender != expected["sender"]:
+            mismatches.append("sender")
+    except MailCtlError:
+        mismatches.append("sender")
+    if draft.get("subject") != expected["subject"]:
+        mismatches.append("subject")
+    # Rich-text attachment markers are not silently stripped: uncertain body evidence blocks sending.
+    if draft.get("content") != expected["body"]:
+        mismatches.append("body")
+    actual = draft.get("attachments")
+    hashes_checked = False
+    if not isinstance(actual, list):
+        mismatches.append("attachments_unverified")
+    else:
+        try:
+            paths = []
+            for item in actual:
+                value = str(item.get("path") or "")
+                parsed = urlparse(value)
+                if parsed.scheme == "file" and parsed.netloc in {"", "localhost"}:
+                    value = unquote(parsed.path)
+                elif parsed.scheme or not Path(value).is_absolute():
+                    raise ValueError("Unresolvable attachment reference")
+                paths.append(value)
+            evidence = attachment_preflight(paths)
+            signature = lambda items: Counter((x["name"], x["size_bytes"], x["sha256"]) for x in items)
+            hashes_checked = True
+            if signature(evidence) != signature(attachments):
+                mismatches.append("attachments")
+        except (ValueError, OSError, MailCtlError):
+            mismatches.append("attachments_unverified")
+    return {"verified": not mismatches, "mismatch_fields": mismatches, "attachment_sha256_checked": hashes_checked,
+            "evidence": "open_draft_readback_and_referenced_files", "delivery_verified": False}
+
+
+def prepare_verified_draft(args: argparse.Namespace, *, update: bool = False, prepared=None) -> dict:
+    if args.command == "send":
+        raise MailCtlError("Direct send must use the digest-confirmed guarded workflow.")
+    payload, evidence = prepared if prepared is not None else outgoing_preflight(args, "compose")
+    if update:
+        current = draft_snapshot(run_backend({"command": "draft_read", "draft_id": args.draft_id}, args.timeout)["data"])
+        if operation_state.digest(current) != args.expected_revision:
+            raise MailCtlError("Draft revision changed. Read the draft again before updating.")
+        payload.update(command="draft_update", draft_id=args.draft_id, expected_snapshot=current, confirm_change=args.confirm_change)
+    created = run_backend(payload, args.timeout)["data"]
+    current = draft_snapshot(run_backend({"command": "draft_read", "draft_id": created["draft_id"]}, args.timeout)["data"])
+    verification = draft_verification(current, payload, evidence)
+    result = {"ok": True, "command": "draft update" if update else args.command,
+              "data": {**current, "sent": False, "revision": operation_state.digest(current), "verification": verification},
+              "preflight": {key: payload[key] for key in ("sender", "to", "cc", "bcc", "subject")}}
+    return result
+
+
 def add_location(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mailbox", default="INBOX", help="Standard alias or slash-delimited custom mailbox path.")
     parser.add_argument("--account", help="Mail account name when the mailbox is ambiguous.")
@@ -321,6 +404,9 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--before", help="ISO date/time exclusive upper bound with UTC offset.")
     search.add_argument("--limit", type=int, default=100)
     search.add_argument("--cursor", help="Opaque next_cursor returned by a previous identical search.")
+    search.add_argument("--account", help="Exact account_key from an index search result.")
+    search.add_argument("--exact-address", action="store_true")
+    search.add_argument("--message-id", help="Exact RFC Message-ID.")
 
     thread = sub.add_parser("thread", help="List one complete Mail conversation from the read-only index.")
     thread.add_argument("conversation_id", type=int)
@@ -341,7 +427,14 @@ def build_parser() -> argparse.ArgumentParser:
     triage.add_argument("--since", help="ISO date/time lower bound.")
     triage.add_argument("--unread", action="store_true")
     triage.add_argument("--max-chars", type=int, default=30000)
+    triage.add_argument("--batch-size", type=int, choices=range(1, 21), default=20)
     triage.add_argument("--output", help="Optional new private JSON artifact for dashboard reconciliation.")
+
+    batch = sub.add_parser("read-batch", help="Read up to 100 exact Mail IDs in bounded groups.")
+    batch.add_argument("--id", dest="message_ids", type=int, action="append", required=True)
+    add_location(batch)
+    batch.add_argument("--batch-size", type=int, choices=range(1, 21), default=20)
+    batch.add_argument("--max-chars", type=int, default=30000)
 
     mark = sub.add_parser("mark", help="Mark a message read or unread.")
     mark.add_argument("message_id", type=int)
@@ -383,6 +476,39 @@ def build_parser() -> argparse.ArgumentParser:
     add_location(reply)
     add_body(reply)
     reply.add_argument("--all", dest="reply_all", action="store_true")
+    for mutation in (compose, send, reply, mark, flag, move, trash):
+        mutation.add_argument("--operation-id", help="Stable UUID; repeated completed requests return their receipt.")
+    receipt = sub.add_parser("receipt", help="Read one private operation receipt.")
+    receipt.add_argument("operation_id")
+    reconcile = sub.add_parser("receipt-reconcile", help="Annotate a send receipt with exact Sent metadata; never enables retries.")
+    reconcile.add_argument("operation_id")
+    reconcile.add_argument("--message-id", required=True, help="Exact RFC Message-ID including angle brackets.")
+    reconcile.add_argument("--account-key", required=True, help="Exact index account_key, not the display name.")
+    reconcile.add_argument("--database")
+
+    resolve = sub.add_parser("resolve", help="Resolve an exact RFC Message-ID to a current Mail object in one mailbox.")
+    resolve.add_argument("rfc_message_id")
+    add_location(resolve)
+    draft = sub.add_parser("draft", help="Inspect, verify, or revision-guard an open outgoing draft.")
+    draft_sub = draft.add_subparsers(dest="draft_command", required=True)
+    for name in ("show", "verify", "update"):
+        item = draft_sub.add_parser(name)
+        item.add_argument("draft_id", type=int)
+        if name in {"verify", "update"}:
+            add_outgoing(item)
+        if name == "update":
+            item.add_argument("--expected-revision", required=True)
+            item.add_argument("--confirm-change", action="store_true", required=True)
+            item.add_argument("--operation-id")
+    attachments = sub.add_parser("attachments", help="List message attachment metadata or save one exact attachment locally.")
+    attachments_sub = attachments.add_subparsers(dest="attachments_command", required=True)
+    for name in ("list", "save"):
+        item = attachments_sub.add_parser(name)
+        item.add_argument("message_id", type=int)
+        add_location(item)
+        if name == "save":
+            item.add_argument("--attachment-id", required=True)
+            item.add_argument("--output", required=True, help="New destination file; existing files are refused.")
 
     index = sub.add_parser("index", help="Read-only Apple Mail index audit commands.")
     index_sub = index.add_subparsers(dest="index_command", required=True)
@@ -408,6 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("manifest")
     audit.add_argument("--database")
     audit.add_argument("--csv")
+    audit.add_argument("--fresh", action="store_true", help="Read fresh attachment evidence instead of using cached results.")
+    difference = campaign_sub.add_parser("diff", help="Preview exact differences between two campaign manifests.")
+    difference.add_argument("before")
+    difference.add_argument("after")
+    explain = campaign_sub.add_parser("explain", help="Explain the evidence and blockers for one campaign row.")
+    explain.add_argument("manifest")
+    explain.add_argument("--key", required=True)
+    explain.add_argument("--database")
     next_batch = campaign_sub.add_parser("next", help="Return the next safe missing batch from a rendered queue.")
     next_batch.add_argument("manifest")
     next_batch.add_argument("--queue", required=True, help="Rendered queue.json path.")
@@ -421,6 +555,13 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("manifest")
     dashboard.add_argument("--database")
     dashboard.add_argument("--triage", help="Private triage JSON artifact created by mailctl triage.")
+    followups = campaign_sub.add_parser("followups", help="Build a local human-review worklist; never sends or schedules follow-ups.")
+    followups.add_argument("manifest")
+    followups.add_argument("--account-key", required=True)
+    followups.add_argument("--database")
+    followups.add_argument("--after-days", type=int, default=7)
+    followups.add_argument("--as-of", help="Optional timezone-aware date/time for reproducible review.")
+    followups.add_argument("--output", help="New private JSON artifact; refuses existing files.")
     rebalance = campaign_sub.add_parser("rebalance", help="Create a minimal-movement, quota-aware replacement schedule manifest.")
     rebalance.add_argument("manifest")
     rebalance.add_argument("--output", required=True)
@@ -441,11 +582,13 @@ def build_parser() -> argparse.ArgumentParser:
     session_next.add_argument("session")
     session_next.add_argument("--database")
     session_next.add_argument("--limit", type=int, default=20)
+    session_next.add_argument("--owner", default="mailctl")
     session_record = campaign_sub.add_parser("session-record", help="Record one visible-UI attempt without claiming verification.")
     session_record.add_argument("session")
     session_record.add_argument("--key", required=True)
     session_record.add_argument("--result", required=True, choices=["applied", "failed", "skipped"])
     session_record.add_argument("--note")
+    session_record.add_argument("--claim-token", help="Ownership token returned by session-next; required to record a result.")
     session_status = campaign_sub.add_parser("session-status", help="Summarize a resumable scheduling session.")
     session_status.add_argument("session")
     session_reconcile = campaign_sub.add_parser("session-reconcile", help="Verify session outcomes against Sent and Send Later.")
@@ -454,6 +597,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ubd = sub.add_parser("ubd", help="Create redacted UBD OS events or use its proposal-only Agent API.")
     ubd_sub = ubd.add_subparsers(dest="ubd_command", required=True)
+    retry = ubd_sub.add_parser("retry-proposal", help="Resubmit exactly the saved redacted proposal with its original idempotency key.")
+    retry.add_argument("operation_id")
+    retry.add_argument("--confirm-proposal", action="store_true", required=True)
+    add_ubd_connection(retry)
 
     ubd_capabilities = ubd_sub.add_parser("capabilities", help="Read and verify UBD Agent API capabilities.")
     add_ubd_connection(ubd_capabilities)
@@ -556,6 +703,8 @@ def capabilities() -> dict[str, Any]:
             "command_classes": {
                 "offline_read_only": [
                     "capabilities",
+                    "receipt",
+                    "campaign diff",
                     "campaign validate",
                     "campaign plan",
                 ],
@@ -567,6 +716,10 @@ def capabilities() -> dict[str, Any]:
                     "campaign session-*",
                     "triage --output",
                     "ubd *-event --output",
+                    "attachments save",
+                    "mutation receipts and ownership claims",
+                    "receipt-reconcile",
+                    "campaign followups --output",
                 ],
                 "mail_read_only": [
                     "doctor",
@@ -577,6 +730,14 @@ def capabilities() -> dict[str, Any]:
                     "search",
                     "thread",
                     "read",
+                    "read-batch",
+                    "receipt-reconcile",
+                    "campaign followups",
+                    "resolve",
+                    "draft show",
+                    "draft verify",
+                    "attachments list",
+                    "campaign explain",
                     "classify",
                     "triage",
                     "index list",
@@ -590,10 +751,10 @@ def capabilities() -> dict[str, Any]:
                     "ubd dashboard-event",
                     "ubd classify-event",
                 ],
-                "mail_draft_mutation": ["compose", "reply"],
+                "mail_draft_mutation": ["compose", "reply", "draft update"],
                 "mail_confirmed_mutation": ["mark", "flag", "move", "trash", "send"],
                 "ubd_read_only": ["ubd capabilities", "ubd work-list", "ubd work-get"],
-                "ubd_proposal_only": ["ubd propose-campaign-audit", "ubd propose-classification", "ubd propose-dashboard"],
+                "ubd_proposal_only": ["ubd propose-campaign-audit", "ubd propose-classification", "ubd propose-dashboard", "ubd retry-proposal"],
             },
             "hard_boundaries": {
                 "mail_index_write": False,
@@ -618,6 +779,13 @@ def capabilities() -> dict[str, Any]:
                 "send_later_emlx_fallback_read_only": True,
                 "send_later_evidence_cache_private_local_only": True,
                 "send_later_evidence_cache_contains_message_bodies": False,
+                "mail_mutations_automatically_retried": False,
+                "send_acceptance_is_delivery_evidence": False,
+                "scheduling_claim_token_required": True,
+                "cross_campaign_identity_claims": True,
+                "sent_observation_is_delivery_evidence": False,
+                "followups_human_review_only": True,
+                "read_batch_max_ids_per_backend_call": 20,
             },
         },
     }
@@ -641,6 +809,7 @@ def doctor(timeout: int) -> dict[str, Any]:
     if ready:
         try:
             checks["backend_ping"] = run_backend({"command": "ping"}, timeout)["data"]
+            checks["automation_probe"] = run_backend({"command": "probe"}, timeout)["data"]
             if checks["backend_ping"].get("version") != VERSION:
                 checks["backend_version_mismatch"] = True
                 ready = False
@@ -687,16 +856,19 @@ def doctor(timeout: int) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError) as error:
             checks["plugin_manifest_error"] = str(error)
             ready = False
+    else:
+        checks["plugin_manifest_error"] = "Plugin manifest is missing."
+        ready = False
     cache_root = Path.home() / ".codex" / "plugins" / "cache" / "personal" / "apple-mail-cli"
     cache_copies = []
     if cache_root.is_dir():
-        source_digest = file_digest(Path(__file__).resolve())
+        source_digest = {file.name: file_digest(file) for file in SCRIPT_DIR.iterdir() if file.suffix in {".py", ".js"}}
         for candidate in sorted(cache_root.glob("*/skills/apple-mail-cli/scripts/mailctl.py")):
             cache_copies.append(
                 {
                     "version": candidate.parents[3].name,
                     "path": str(candidate),
-                    "matches_current": file_digest(candidate) == source_digest,
+                    "matches_current": {file.name: file_digest(file) for file in candidate.parent.iterdir() if file.suffix in {".py", ".js"}} == source_digest,
                 }
             )
     checks["installed_cache_copies"] = cache_copies
@@ -712,10 +884,46 @@ def doctor(timeout: int) -> dict[str, Any]:
     }
 
 
+def latest_reply_text(content: str) -> str:
+    lines = []
+    for line in content.splitlines():
+        if re.match(r"^\s*(On .+wrote:|[-_]{2,}\s*(Original Message|原始郵件)|From:|寄件者[:：]|在.+寫道[:：])", line, re.I):
+            break
+        if line.strip() == "--":
+            break
+        # Footer instructions must start the line. A person's "I would like to
+        # unsubscribe" is intent, not a boilerplate footer.
+        footer = re.match(r"^\s*(?:(?:to unsubscribe[,;:]?\s+(?:please\s+)?(?:click|visit|follow|use|reply|go to)\b)|click here to unsubscribe\b|manage (?:your )?(?:email )?preferences\b)", line, re.I)
+        if line.lstrip().startswith(">") or footer:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def explicit_opt_out(content: str) -> bool:
+    patterns = (
+        r"\b(?:please\s+|kindly\s+)?unsubscribe\s+(?:me|us)\b",
+        r"\b(?:please|kindly)\s+unsubscribe\b",
+        r"\b(?:i|we)\s+(?:would\s+like|want|wish|need)\s+to\s+(?:be\s+unsubscribed|unsubscribe)\b",
+        r"\b(?:i|we)['’]d\s+like\s+to\s+unsubscribe\b",
+        r"\b(?:remove|take)\s+(?:me|us)\s+(?:from|off)\b",
+        r"\b(?:stop emailing|do not email|don't email)\b",
+        r"退訂|退订|停止寄送|不要再寄",
+    )
+    for sentence in re.split(r"[.!?。！？\n]+", content.lower()):
+        if re.search(r"\b(?:do not|don't|never)\s+(?:unsubscribe|remove)\b", sentence):
+            continue
+        if sentence.strip() == "unsubscribe" or any(re.search(pattern, sentence) for pattern in patterns):
+            return True
+    return False
+
+
 def classify_message(message: dict[str, Any]) -> dict[str, Any]:
     subject = str(message.get("subject") or "")
     sender = str(message.get("sender") or "")
-    content = str(message.get("content") or "")
+    original_content = str(message.get("content") or "")
+    content = latest_reply_text(original_content)
+    headers = Parser(policy=email_policy.default).parsestr(str(message.get("headers") or "")[:65536], headersonly=True)
     combined = f"{subject}\n{sender}\n{content}"
     lowered = combined.lower()
     evidence: list[str] = []
@@ -738,8 +946,19 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
         "無法投遞",
         "无法投递",
     ]
-    dmarc = "dmarc" in lowered and ("aggregate report" in lowered or any(item["name"].lower().endswith((".xml", ".zip", ".gz")) for item in message.get("attachments", [])))
-    if any(term in lowered for term in bounce_terms):
+    attachments = message.get("attachments", [])
+    attachment_metadata_unavailable = not isinstance(attachments, list)
+    names = []
+    for item in attachments if isinstance(attachments, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            names.append(item["name"].lower())
+        else:
+            attachment_metadata_unavailable = True
+    dmarc = "dmarc" in lowered and ("aggregate report" in lowered or any(name.endswith((".xml", ".zip", ".gz")) for name in names))
+    if explicit_opt_out(content):
+        kind, confidence, action = "unsubscribe_request", 0.99, "Review and record the explicit opt-out before any future campaign."
+        evidence.append("Explicit unsubscribe or stop-contact wording in the latest reply")
+    elif any(term in lowered for term in bounce_terms):
         if "unable to look up host" in lowered or "name or service not known" in lowered or "5.4.4" in lowered:
             kind, confidence, action = "bounce_transient_dns", 0.98, "Record the temporary DNS failure and do not retry automatically."
             evidence.append("DNS lookup or 5.4.4 delivery failure")
@@ -752,21 +971,6 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
     elif dmarc:
         kind, confidence, action = "dmarc_report", 0.99, "Inspect authentication results if requested; no reply is normally needed."
         evidence.append("DMARC aggregate-report signal")
-    elif any(
-        term in lowered
-        for term in [
-            "unsubscribe",
-            "remove me from",
-            "stop emailing",
-            "do not email",
-            "退訂",
-            "退订",
-            "停止寄送",
-            "不要再寄",
-        ]
-    ):
-        kind, confidence, action = "unsubscribe_request", 0.99, "Suppress the address and record the opt-out before any future campaign."
-        evidence.append("Explicit unsubscribe or stop-contact wording")
     elif any(
         term in lowered
         for term in [
@@ -796,7 +1000,7 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
     ):
         kind, confidence, action = "out_of_office", 0.94, "Record the return date or alternate contact and wait before following up."
         evidence.append("Out-of-office wording")
-    elif any(term in lowered for term in ["automatic reply", "auto-reply", "automated response", "this is an automated", "thank you for contacting", "自動回覆", "自动回复", "自動回信", "自动回信"]):
+    elif (headers.get("Auto-Submitted", "no").lower() != "no") or any(term in lowered for term in ["automatic reply", "auto-reply", "automated response", "this is an automated", "自動回覆", "自动回复", "自動回信", "自动回信"]):
         discovered = sorted(set(address.lower() for address in EMAIL_PATTERN.findall(content)))
         if discovered:
             kind, confidence, action = "auto_reply_with_contacts", 0.9, "Review any suggested partnership or PR contact and update tracking before resending."
@@ -804,7 +1008,7 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
         else:
             kind, confidence, action = "auto_reply", 0.85, "Record the acknowledgement and wait unless it requests another action."
             evidence.append("Automated-response wording")
-    elif subject.lower().startswith(("re:", "fw:", "fwd:", "回覆:", "回复:")):
+    elif headers.get("In-Reply-To") or subject.lower().startswith(("re:", "fw:", "fwd:", "回覆:", "回复:")):
         positive_terms = ["interested", "sounds good", "let's discuss", "lets discuss", "有興趣", "有兴趣", "可以傾", "可以聊"]
         negative_terms = ["not interested", "no thanks", "not a fit", "沒有興趣", "没有兴趣", "暫不考慮", "暂不考虑"]
         question_terms = ["?", "？", "could you", "can you", "請問", "请问", "想了解"]
@@ -823,6 +1027,9 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
     else:
         kind, confidence, action = "unclassified", 0.4, "Review manually."
     discovered_contacts = sorted(set(address.lower() for address in EMAIL_PATTERN.findall(content)))
+    truncated = bool(message.get("content_truncated"))
+    if truncated:
+        confidence = min(confidence, 0.5)
     return {
         "kind": kind,
         "confidence": confidence,
@@ -831,6 +1038,10 @@ def classify_message(message: dict[str, Any]) -> dict[str, Any]:
         "smtp_codes": smtp_codes,
         "discovered_contacts": discovered_contacts[:20],
         "suggested_action": action,
+        "confidence_basis": "heuristic_not_calibrated",
+        "requires_review": truncated or attachment_metadata_unavailable or confidence < 0.8,
+        "attachment_metadata_unavailable": attachment_metadata_unavailable,
+        "quoted_or_signature_text_removed": content != original_content.strip(),
     }
 
 
@@ -848,19 +1059,26 @@ def triage_mailbox(args: argparse.Namespace) -> dict[str, Any]:
         args.timeout,
     )["data"]
     items = []
+    errors = []
+    stopped_early = False
+    attempted = 0
     counts: dict[str, int] = {}
-    for summary in listing.get("messages", []):
-        message = run_backend(
-            {
-                "command": "read",
-                "message_id": summary["id"],
-                "mailbox": args.mailbox,
-                "account": args.account,
-                "max_chars": args.max_chars,
-            },
-            args.timeout,
-        )["data"]
-        classification = classify_message(message)
+    attempted_ids = []
+    for message_id, message, failure in batch_read.read_selected(args, listing.get("messages", []), run_backend, MailCtlError):
+        attempted += 1
+        attempted_ids.append(message_id)
+        try:
+            if failure:
+                raise failure
+            classification = classify_message(message)
+        except Exception as error:
+            code = error.code if isinstance(error, MailCtlError) else "message_classification_failed"
+            # Do not copy arbitrary exception text into a body-free triage artifact.
+            errors.append({"id": message_id, "code": code, "type": type(error).__name__,
+                           "message": "This message could not be read or classified; inspect it individually.", "requires_review": True})
+            if code in batch_read.FATAL_CODES:
+                stopped_early = True
+            continue
         kind = classification["kind"]
         counts[kind] = counts.get(kind, 0) + 1
         _, sender_address = parseaddr(str(message.get("sender") or ""))
@@ -878,13 +1096,21 @@ def triage_mailbox(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     result = {
-        "ok": True,
+        "ok": not errors,
         "command": "triage",
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "mailbox": listing.get("mailbox"),
         "account_filter": listing.get("account_filter"),
         "scanned": listing.get("scanned"),
         "returned": len(items),
+        "selected": len(listing.get("messages", [])),
+        "attempted": attempted,
+        "failed": len(errors),
+        "complete": not errors,
+        "partial": bool(errors and items),
+        "stopped_early": stopped_early,
+        "not_attempted_ids": [row.get("id") for row in listing.get("messages", []) if row.get("id") not in attempted_ids],
+        "errors": errors,
         "truncated": listing.get("truncated"),
         "classification_counts": dict(sorted(counts.items())),
         "items": items,
@@ -909,8 +1135,8 @@ def outgoing_payload(args: argparse.Namespace, command: str) -> tuple[dict[str, 
     return outgoing_preflight(args, command)
 
 
-def guarded_send(args: argparse.Namespace) -> dict[str, Any]:
-    payload, evidence = outgoing_preflight(args, "send")
+def guarded_send(args: argparse.Namespace, *, prepared=None) -> dict[str, Any]:
+    payload, evidence = prepared if prepared is not None else outgoing_preflight(args, "send")
     intent = send_guard.canonical_intent(payload, evidence)
     digest = send_guard.intent_digest(intent)
     confirmation = getattr(args, "confirm_send", None)
@@ -950,7 +1176,7 @@ def write_private_json(path_value: str | None, value: dict[str, Any]) -> str | N
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as error:
-        raise MailCtlError(f"Refusing to overwrite existing UBD event artifact: {path}") from error
+        raise MailCtlError(f"Refusing to overwrite existing local artifact: {path}") from error
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
@@ -1017,18 +1243,45 @@ def store_event_proposal(
     work: dict[str, Any],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    operation_id = str(uuid.UUID(args.idempotency_key))
     proposal = ubd_connector.proposal_payload(event, work, expected_revision=args.expected_revision)
-    response = client.tool(
-        "work.propose_update",
-        proposal,
-        idempotency_key=args.idempotency_key,
-    )
-    return ubd_connector.verify_proposal_response(
-        response,
-        expected_work_item_id=args.work_item_id,
-        expected_revision=args.expected_revision,
-        expected_request_id=args.idempotency_key,
-    )
+    try:
+        saved = operation_state.get(operation_id)
+    except ValueError:
+        saved = None
+    if saved:
+        request = saved.get("request", {})
+        if (request.get("event_id") != event["event"]["id"] or request.get("proposal", {}).get("expectedRevision") != args.expected_revision
+                or request.get("origin") != getattr(client, "origin", None)):
+            raise MailCtlError("The proposal ID belongs to different evidence or a different work revision.")
+        if saved["state"] == "completed":
+            return saved["result"]
+        raise MailCtlError("Proposal outcome is uncertain. Inspect receipt and use ubd retry-proposal with the same ID after reviewing UBD state.")
+    operation_state.begin(operation_id, "ubd proposal", {"event_id": event["event"]["id"], "proposal": proposal, "origin": getattr(client, "origin", None)}, retain_request=True)
+    return submit_saved_proposal(client, operation_id)
+
+
+def submit_saved_proposal(client, operation_id: str, *, retry: bool = False) -> dict:
+    saved = operation_state.get(operation_id)
+    if saved.get("command") != "ubd proposal":
+        raise MailCtlError("Receipt is not a UBD proposal.")
+    proposal = saved["request"]["proposal"]
+    if saved["request"].get("origin") != getattr(client, "origin", None):
+        raise MailCtlError("Saved proposal belongs to a different UBD origin.")
+    if saved["state"] == "completed":
+        return saved["result"]
+    permitted = {"prepared", "unknown", "submitting"} if retry else {"prepared"}
+    if saved["state"] not in permitted:
+        raise MailCtlError("Proposal is in flight or completed; inspect its receipt.")
+    operation_state.transition(operation_id, "submitting", expected=saved["state"])
+    try:
+        response = client.tool("work.propose_update", proposal, idempotency_key=operation_id)
+        checked = ubd_connector.verify_proposal_response(response, expected_work_item_id=proposal["workItemId"], expected_revision=proposal["expectedRevision"], expected_request_id=operation_id)
+        operation_state.transition(operation_id, "completed", checked)
+        return checked
+    except BaseException:
+        operation_state.transition(operation_id, "unknown")
+        raise
 
 
 def execute_ubd(args: argparse.Namespace) -> dict[str, Any]:
@@ -1092,6 +1345,17 @@ def execute_ubd(args: argparse.Namespace) -> dict[str, Any]:
 
     client = ubd_api_client(args)
     capabilities = client.capabilities()
+    if args.ubd_command == "retry-proposal":
+        saved = operation_state.get(args.operation_id)
+        if saved.get("command") != "ubd proposal" or not args.confirm_proposal:
+            raise MailCtlError("Retry requires a saved UBD proposal and current confirmation.")
+        proposal = saved["request"]["proposal"]
+        ubd_connector.verify_capabilities(capabilities, required_tools=ubd_connector.PROPOSAL_REQUIRED_TOOLS,
+                                          business_unit_id=proposal["businessUnitId"])
+        # Exact same endpoint, body and idempotency key; server enforces the saved revision.
+        response = submit_saved_proposal(client, args.operation_id, retry=True)
+        return {"ok": True, "command": "ubd retry-proposal", "data": response,
+                "safety": {"formal_state_changed": False, "human_review_required": True}}
     if args.ubd_command == "capabilities":
         ubd_connector.verify_capabilities(capabilities, required_tools=["system.capabilities"])
         return {
@@ -1221,7 +1485,59 @@ def execute_ubd(args: argparse.Namespace) -> dict[str, Any]:
     raise MailCtlError(f"Unsupported UBD command: {args.ubd_command}")
 
 
-def execute(args: argparse.Namespace) -> dict[str, Any]:
+def _execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "receipt-reconcile":
+        return {"command": "receipt-reconcile", **mail_workflow.receipt_reconcile(
+            args.operation_id, args.message_id, args.account_key, database=args.database)}
+    if args.command == "read-batch":
+        items, errors, attempted = [], [], set()
+        for message_id, item, failure in batch_read.read_selected(args, [{"id": value} for value in args.message_ids], run_backend, MailCtlError):
+            attempted.add(message_id)
+            if failure:
+                errors.append({"id": message_id, "code": failure.code, "requires_review": True})
+            else:
+                items.append(item)
+        skipped = [value for value in args.message_ids if value not in attempted]
+        return {"ok": not errors and not skipped, "command": "read-batch", "data": {
+            "items": items, "errors": errors, "not_attempted_ids": skipped, "complete": not errors and not skipped}}
+    if args.command == "receipt":
+        return {"ok": True, "command": "receipt", "data": operation_state.get(args.operation_id)}
+    if args.command == "resolve":
+        return run_backend({"command": "resolve", "rfc_message_id": args.rfc_message_id,
+                            "mailbox": args.mailbox, "account": args.account}, args.timeout)
+    if args.command == "draft":
+        if args.draft_command == "update":
+            return prepare_verified_draft(args, update=True)
+        current = draft_snapshot(run_backend({"command": "draft_read", "draft_id": args.draft_id}, args.timeout)["data"])
+        data = {**current, "revision": operation_state.digest(current), "sent": False}
+        if args.draft_command == "verify":
+            payload, evidence = outgoing_preflight(args, "compose")
+            data["verification"] = draft_verification(current, payload, evidence)
+        return {"ok": data.get("verification", {}).get("verified", True), "command": "draft " + args.draft_command, "data": data}
+    if args.command == "attachments":
+        location = {"message_id": args.message_id, "mailbox": args.mailbox, "account": args.account}
+        metadata = run_backend({"command": "attachments_list", **location}, args.timeout)["data"]
+        if args.attachments_command == "list":
+            return {"ok": metadata is not None, "command": "attachments list", "data": metadata}
+        matches = [item for item in metadata or [] if item.get("id") == args.attachment_id]
+        if len(matches) != 1:
+            raise MailCtlError("Attachment ID must match exactly one readable attachment.")
+        output = Path(args.output).expanduser().absolute()
+        if output.exists() or output.is_symlink():
+            raise MailCtlError("Attachment output already exists; overwriting is refused.")
+        if not output.parent.is_dir():
+            raise MailCtlError("Attachment output parent directory must already exist.")
+        # Save to a private sibling first; publish via exclusive hard link so races cannot overwrite a file.
+        with tempfile.TemporaryDirectory(prefix=".mailctl-attachment-", dir=output.parent) as temp:
+            stage = Path(temp) / "attachment"
+            run_backend({"command": "attachment_save", **location, "attachment_id": args.attachment_id, "output": str(stage)}, args.timeout)
+            if not stage.is_file() or stage.is_symlink():
+                raise MailCtlError("Mail did not produce a regular attachment file.")
+            stage.chmod(0o600)
+            evidence = attachment_preflight([str(stage)])[0]
+            os.link(stage, output)
+        evidence.update(path=str(output), name=output.name)
+        return {"ok": True, "command": "attachments save", "data": evidence, "mail_mutated": False}
     if args.command == "capabilities":
         return capabilities()
     if args.command == "doctor":
@@ -1250,6 +1566,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 before=args.before,
                 limit=args.limit,
                 cursor=args.cursor,
+                account=args.account,
+                exact_address=args.exact_address,
+                message_id=args.message_id,
             ),
         }
     if args.command == "thread":
@@ -1276,6 +1595,20 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         data = mail_index.counts(rows) if args.index_command == "counts" else rows
         return {"ok": True, "command": f"index {args.index_command}", "mail_index": str(path), "data": data}
     if args.command == "campaign":
+        if args.campaign_command == "followups":
+            result = {"command": "campaign followups", **mail_workflow.followups(
+                args.manifest, args.account_key, database=args.database, after_days=args.after_days, as_of=args.as_of)}
+            if args.output:
+                result["output"] = write_private_json(args.output, result)
+            return result
+        if args.campaign_command == "diff":
+            return {"command": "campaign diff", **campaign.campaign_diff(args.before, args.after)}
+        if args.campaign_command == "explain":
+            audit = campaign.audit_campaign(args.manifest, database=args.database, fresh=True)
+            matches = [row for row in audit["results"] if row["key"] == args.key]
+            if not matches:
+                raise MailCtlError("Campaign key not found.")
+            return {"ok": True, "command": "campaign explain", "data": matches[0]}
         if args.campaign_command == "validate":
             return {"command": "campaign validate", **public_campaign_report(campaign.validate_manifest(args.manifest))}
         if args.campaign_command == "plan":
@@ -1284,7 +1617,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         if args.campaign_command == "render":
             return {"command": "campaign render", **campaign.render_campaign(args.manifest, args.output, force=args.force)}
         if args.campaign_command == "audit":
-            return {"command": "campaign audit", **campaign.audit_campaign(args.manifest, database=args.database, csv_path=args.csv)}
+            return {"command": "campaign audit", **campaign.audit_campaign(args.manifest, database=args.database, csv_path=args.csv, fresh=args.fresh)}
         if args.campaign_command == "dashboard":
             return {
                 "command": "campaign dashboard",
@@ -1330,12 +1663,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         if args.campaign_command == "session-next":
             return {
                 "command": "campaign session-next",
-                **campaign.next_session_operations(args.session, database=args.database, limit=args.limit),
+                **campaign.next_session_operations(args.session, database=args.database, limit=args.limit, owner=args.owner),
             }
         if args.campaign_command == "session-record":
             return {
                 "command": "campaign session-record",
-                **campaign.record_schedule_session(args.session, key=args.key, result=args.result, note=args.note),
+                **campaign.record_schedule_session(args.session, key=args.key, result=args.result, note=args.note, claim_token=args.claim_token),
             }
         if args.campaign_command == "session-status":
             return {"command": "campaign session-status", **campaign.session_status(args.session)}
@@ -1352,10 +1685,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "send":
         return guarded_send(args)
     if args.command == "compose":
-        payload, evidence = outgoing_payload(args, args.command)
-        result = run_backend(payload, args.timeout)
-        result["preflight"] = {"to": args.to, "cc": args.cc, "bcc": args.bcc, "sender": args.sender, "subject": args.subject, "attachments": evidence}
-        return result
+        return prepare_verified_draft(args)
     if args.command == "reply":
         return run_backend(
             {
@@ -1449,7 +1779,54 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         raise MailCtlError(f"Unsupported command: {args.command}")
-    return run_backend(payload, args.timeout)
+    result = run_backend(payload, args.timeout)
+    if result.get("data", {}).get("verified") is False and args.command in {"mark", "flag"}:
+        result.update(ok=False, error={"code": "mutation_unverified", "message": "Mail readback differs from the requested state.", "retryable": False})
+    return result
+
+
+def execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "send" and getattr(args, "confirm_send", None) is None:
+        return guarded_send(args)  # Offline preview must not create receipts or load Mail.
+    mutations = {"compose", "send", "reply", "mark", "flag", "move", "trash"}
+    draft_update = args.command == "draft" and args.draft_command == "update"
+    if args.command not in mutations and not draft_update:
+        return _execute(args)
+    operation_id = str(uuid.UUID(args.operation_id)) if args.operation_id else str(uuid.uuid4())
+    request = {key: value for key, value in vars(args).items() if key not in {"operation_id", "compact", "timeout"}}
+    prepared = outgoing_preflight(args, "send") if args.command == "send" else None
+    if prepared:
+        digest = send_guard.intent_digest(send_guard.canonical_intent(*prepared))
+        if type(args.confirm_send) is not str or args.confirm_send != digest:
+            raise MailCtlError("Confirmation does not match the current outbound intent.", code="send_intent_mismatch")
+    if args.command in {"compose", "send", "reply"} or draft_update:
+        request["body_sha256"] = hashlib.sha256((prepared[0]["body"] if prepared else validated_body(args)).encode()).hexdigest()
+    if args.command in {"compose", "send"} or draft_update:
+        request["attachment_evidence"] = prepared[1] if prepared else attachment_preflight(args.attachment)
+    saved = operation_state.begin(operation_id, args.command, request)
+    if saved["state"] in {"completed", "accepted"}:
+        return {**saved["result"], "replayed_receipt": True}
+    if saved["state"] != "prepared":
+        raise MailCtlError(f"Operation {operation_id} is in flight or uncertain. Inspect its receipt before another attempt.", code="operation_unknown")
+    if prepared:
+        payload, evidence = prepared
+        intent = {key: payload[key] for key in ("sender", "to", "cc", "bcc", "subject")}
+        intent.update(body_sha256=request["body_sha256"], attachments=[
+            {key: item[key] for key in ("name", "size_bytes", "sha256")} for item in evidence])
+        operation_state.annotate(operation_id, "send_intent", intent)
+    operation_state.transition(operation_id, "submitting", expected="prepared")
+    try:
+        result = guarded_send(args, prepared=prepared) if prepared else _execute(args)
+        result["operation_id"] = operation_id
+        state = "accepted" if result.get("data", {}).get("accepted") or result.get("data", {}).get("submission_accepted") else "completed" if result.get("ok") else "unknown"
+        operation_state.transition(operation_id, state, result)
+        return result
+    except BaseException as error:
+        operation_state.transition(operation_id, "unknown")
+        if isinstance(error, MailCtlError):
+            error.retryable = False
+            error.hint = f"Inspect mailctl receipt {operation_id}; do not retry the mutation automatically."
+        raise
 
 
 def structured_error(error: Exception, command: str | None) -> dict[str, Any]:
@@ -1468,12 +1845,18 @@ def structured_error(error: Exception, command: str | None) -> dict[str, Any]:
         code, hint, retryable = "ubd_connector_error", "Verify UBD OS scope, revision, capabilities, and the pending proposal state.", False
     elif isinstance(error, OSError):
         code, hint, retryable = "filesystem_error", "Check the path and permissions; no Mail mutation was assumed.", False
+    elif isinstance(error, ValueError):
+        code, hint, retryable = "validation_error", "Review the exact arguments and saved evidence; do not bypass an uncertain operation.", False
+        message = "Invalid arguments or inconsistent saved evidence; no successful result was confirmed."
     else:
         code, hint, retryable = "unexpected_error", "Run mailctl doctor and retry only after reviewing actual Mail state.", False
         message = "Unexpected local failure; no successful result was confirmed."
     return {
         "ok": False,
         "command": command,
+        "schema_version": CLI_SCHEMA_VERSION,
+        "version": VERSION,
+        "observed_at": operation_state.now(),
         "error": {
             "code": code,
             "type": error.__class__.__name__,
@@ -1491,11 +1874,11 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         result = execute(args)
+        result.setdefault("schema_version", CLI_SCHEMA_VERSION)
+        result.setdefault("version", VERSION)
+        result.setdefault("observed_at", operation_state.now())
         emit(result, compact=args.compact)
         return 0 if result.get("ok") else 1
-    except (MailCtlError, campaign.CampaignError, mail_index.MailIndexError, ubd_connector.UbdConnectorError, OSError) as error:
-        emit(structured_error(error, args.command), compact=args.compact)
-        return 1
     except Exception as error:
         emit(structured_error(error, args.command), compact=args.compact)
         return 1
