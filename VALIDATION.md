@@ -1,4 +1,40 @@
-# 0.6.0 integration validation — 2026-10-10
+# 0.6.0 scheduling and saved-draft review validation — 2026-10-11
+
+Status: **experimental**. Fresh full Python suite: 193 passed, one opt-in live
+test skipped. Synthetic JXA logic: 77 checks passed. Native
+Foundation/CommonCrypto: four synthetic protocol cases passed without loading
+Mail. Diff integrity and publication privacy pattern scans are checked separately.
+
+Seven new scheduling tests cover the stale-audit release/acquire interleaving,
+fresh evidence while claims are held, failed/unsafe rechecks, changed and unchanged
+reschedule/cancel targets, and multi-row cleanup preserving previously issued work.
+The exact interleaving failed before the fix and is rejected after it. These are
+synthetic state/claim tests, not native Send Later certification. Claims coordinate
+cooperating current-version CLI workers; they do not lock Mail against manual
+edits, other apps or later synchronization changes. Recheck visibly before acting.
+
+Independent source review reproduced the race before the fix and found no
+additional material findings in the reviewed integration. A separate review of
+the fix confirmed closure and passed 69 synthetic scheduling/evolution tests.
+This scoped review is not a guarantee against remaining defects or live Mail
+behavior. The offline suite passed 191 tests with one live test skipped, excluding
+the two loopback HTTP cases from the full suite.
+
+In separately authorized local work, one existing self-test draft was saved and
+its exact account-scoped saved RFC Message-ID was reviewed. Envelope fields and
+decoded attachment name/size/SHA-256 matched the expectations. Repeated source
+reads and a later review-digest recheck agreed. Stored IDs changed on save, so
+the review required refreshed identity rather than same-subject editor linkage.
+
+The saved copy had HTML and an empty plain-text part, so the result remained
+`needs_content_review`; HTML rendering and the link to the open editor were not
+verified. An earlier separately approved send attempt stopped at pre-dispatch
+verification. Its unknown receipt and attempt guard were preserved byte-for-byte.
+No send was invoked by the saved-review workflow, and no delivery is certified.
+Private addresses, IDs, message bodies, attachment data and receipts are excluded
+from this publication. This one-machine observation is not cross-version coverage.
+
+# Historical 0.6.0 integration validation — 2026-10-10
 
 Status: **experimental**. This public-source update combines local 0.5/0.6
 development with the existing public 0.4.3 guard implementation. The earlier

@@ -24,7 +24,8 @@ boundaries. Run `mailctl --version` when exact implementation identity matters.
   resumable scheduling sessions and checkpoints, private triage JSON, private
   CSV, private event JSON, and an automatically invalidated private Send Later
   evidence cache.
-- Draft mutations: visible `compose`, `reply`, and revision-guarded `draft update`; none sends.
+- Draft mutations: visible `compose`, `reply`, and revision-guarded `draft update`
+  and `draft save`; none sends.
 - Confirmed Mail mutations: `mark`, `flag`, `move`, `trash`, and direct `send`.
 - UBD read-only: capabilities and scoped work reads.
 - UBD proposal-only: a stored campaign or classification proposal that still
@@ -66,6 +67,13 @@ identifies conflicts. All workers must use 0.6 for cross-campaign guarantees;
 old active claims still protect only their legacy scope. Changed pinned Mail
 identity stops reschedule/cancel sessions.
 
+Before issuing a batch, `session-next` performs one additional fresh audit under
+all newly acquired claims. Changed state/Message-IDs, unsafe or incomplete evidence,
+or an audit failure block that unissued batch and release only its new claims.
+Already-issued and uncertain claims remain protected. Inspect and reconcile before
+resuming. This guards cooperating current-version workers, not manual Mail edits
+or synchronization changes after the audit.
+
 `campaign rebalance` always writes a separate manifest. It interprets allowed
 hours and daily counts in `policy.timezone`, counts account-wide Sent and Send
 Later volume by default, locks already-sent campaign rows, preserves valid
@@ -84,6 +92,8 @@ slots, and moves only rows that do not fit the requested window or policy.
   `delivery_confirmed: false`, and the confirmed `intent_digest`.
 - `draft update`: a full field replacement gated by `--expected-revision` from
   `draft show` and `--confirm-change`; it remains unsent even if verification fails.
+- `draft save`: the same revision/confirmation gates plus a stable operation UUID;
+  saves the existing outgoing draft without changing its fields or requesting send.
 - `ubd propose-*`: requires `--confirm-proposal`, exact business-unit/work UUIDs,
   positive current revision, and a UUID idempotency key.
 - A draft request never authorizes `send`; a UBD proposal never authorizes a
@@ -91,6 +101,99 @@ slots, and moves only rows that do not fit the requested window or policy.
 
 These flags are execution gates, not substitutes for current-turn user
 authorization.
+
+### Native draft readback compatibility
+
+Draft body checks accept exact text or one complete, deterministic editor
+representation: each empty LF-delimited paragraph in the approved body is
+represented by U+2028 followed by LF. The final empty split component after a
+trailing LF is not a paragraph. Verification projects the approved body; it
+never strips, trims, NFC-normalizes or replaces arbitrary observed characters.
+Partial projection, changed non-empty text, literal separators, added signatures,
+attachment markers and changed line counts still fail. The original body and
+intent digest are unchanged. `draft verify` reports `body_comparison` as `exact`,
+`mail_empty_paragraphs`, or `mismatch`, plus `body_exact_match`. A compatible
+editor representation is not proof of identical MIME bytes or delivery.
+
+On some native Mail versions, `outgoing.content.attachments()` returns null even
+when the compose window visibly contains attachments. That means unavailable,
+not zero attachments. Creation-only attachment handles, UI filename/size labels,
+or same-subject autosaved Drafts messages do not establish the exact open draft's
+attachment paths and bytes. `save ... in ... as native format` is not a reliable
+draft export on the observed version. No such fallback is used to authorize send.
+This limitation still blocks direct send when attachment evidence is unavailable,
+including a claimed no-attachment message; this patch does not establish native
+attached-message send support on those versions.
+
+Pre-dispatch verification failures now include content-free `diagnostics` with
+the draft ID, mismatched fields, body comparison mode, stage and
+`send_invoked: false`. They survive the outer `send_outcome_unknown` error and
+are retained under `result.error.diagnostics` in the private operation receipt. They are
+observations from the backend, not delivery evidence or retry authority. The
+receipt remains `unknown`, the intent reservation remains blocked, and a new
+operation UUID, edited intent, or removed guard is never an automatic recovery.
+
+### Saved-draft review contract
+
+When native editor attachment enumeration is unavailable, the manual workflow is
+`draft show` → confirmed `draft save` → `draft saved-list` → `draft review-saved`
+→ visual Mail review and a separate human decision. It does not lift the direct
+send guard or introduce a send-existing-draft path.
+
+- `draft save ID --expected-revision SHA --confirm-change --operation-id UUID`
+  guards readable editor fields, calls Mail's save operation, and returns a
+  private replay-safe receipt. `save_request_accepted: true` is not stored-copy
+  verification. The result keeps `saved_copy_verified`, `sent`, `send_attempted`
+  and `open_draft_link_verified` false. Unavailable attachments are not covered
+  by the editor revision. Unknown outcomes block replay; never change UUIDs to
+  bypass them. Saving can replace stored numeric IDs and RFC Message-IDs.
+- `draft saved-list --account NAME --subject 'EXACT SUBJECT'` reads only Drafts
+  candidate metadata (maximum 50 per native query). Account names must identify
+  exactly one account, and candidates are filtered by native account ID and exact
+  subject. More than one result is not an error, but same subject never proves
+  editor linkage. Refresh these IDs after saving; do not assume a prior ID survives.
+- `draft review-saved '<RFC-ID>' --account NAME --sender ADDRESS --to ADDRESS
+  --subject SUBJECT --body-file PATH [--cc ADDRESS] [--bcc ADDRESS]
+  [--attachment PATH] [--output NEW_PATH] [--expected-review-digest SHA]` reads one
+  unique saved Drafts copy in that account. Repeat recipient/attachment arguments
+  as needed. A bare or angle-wrapped RFC Message-ID is accepted; case is preserved.
+  Two source reads and re-resolved native identities must agree. This is a bounded
+  point-in-time observation, not a lock against later autosaves or UI edits.
+
+MIME inspection requires matching native/MIME Message-ID, unambiguous headers,
+exact normalized From/To/CC/BCC and subject, and the complete multiset of decoded
+attachment filenames, sizes and SHA-256 values. Bounds are 40 MiB source text,
+20 attachments totaling 25 MiB, 200 MIME parts and 20 levels. Malformed, signed,
+encrypted or opaque attached MIME fails closed; unnamed non-text content cannot
+prove the attachment set. The source fingerprint hashes the UTF-8 encoding of
+Mail's returned source string, **not raw wire bytes**.
+
+The report schema is `mailctl-saved-draft-review/v1`. It contains the selected
+account/account ID/numeric ID/RFC Message-ID, `source_text_sha256`, expectation
+`intent_digest`, `review_digest`, `issues`, envelope and attachment evidence, and
+the `expected_body` and `saved_plain_body` for private review. Supplied expectations
+are not inferred consent.
+MIME CRLF line endings are converted to LF for body comparison only; no other
+whitespace is stripped. One exact plain-text part or the known Mail empty-paragraph
+projection can match. No/multiple plain parts, leading blank lines, signatures or
+other differences produce `body_requires_review`. An empty plain part alongside
+HTML does not prove the visible email is blank or damaged. HTML rendering is
+always unverified and needs visible inspection in Mail, even if plain text matches.
+
+`status` is `needs_content_review` when issues exist, otherwise
+`awaiting_human_confirmation`. Both require visual review and human confirmation;
+neither authorizes send. `ok: true`/exit 0 means inspection completed, NOT that the
+message passed all checks or was sent. Invalid parsed evidence or a stale review
+digest returns `saved_draft_review_unverified` with exit 1; unavailable/ambiguous
+native selections return the existing backend error. `open_draft_link_verified`,
+`send_authorized`, `send_attempted` and `delivery_verified` always remain false.
+
+`review_digest` binds source, exact saved identity and supplied expectations.
+Rechecking with `--expected-review-digest` rejects any change but never sends or
+reserves a send attempt. It is not a send approval token. The original send intent
+and operation journals remain unchanged. The optional new JSON file is exclusive
+and mode `0600`, includes private body/address data, and must never be published
+or included in UBD events. There is no automatic retry or automatic send fallback.
 
 `campaign render --force` is an owned-artifact replacement, never blanket EML
 cleanup. New files are staged, previous owned artifacts receive a private backup,

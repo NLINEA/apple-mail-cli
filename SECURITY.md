@@ -2,8 +2,9 @@
 
 Version 0.6.0 is experimental. The earlier bounded independent review covers
 only 0.4.3; it does not certify this integration. Fresh 0.6.0 regression results
-are in VALIDATION.md. Native Mail mutation and delivery behavior remains
-unverified, with no response-time commitment.
+are in VALIDATION.md. One native draft-save and saved-copy review is recorded
+there; other native mutation behavior and delivery remain unverified, with no
+response-time commitment.
 
 For a security report, use this repository's Security tab and **Report a
 vulnerability** when GitHub private vulnerability reporting is available. Its
@@ -63,7 +64,9 @@ provider credentials or external API. UBD OS access is separate and optional.
 ## Additional native validation
 
 Independent review of the 0.4.3 protocol passed. Native Mail validation remains
-separate, explicitly authorized work. Existing read-only index access and a
+separate, explicitly authorized work. The following paragraph records the older
+0.4.3 checks; see VALIDATION.md for the later bounded saved-draft review.
+Existing read-only index access and a
 bounded synthetic-subject metadata query succeeded; no real draft, send,
 delete, move, mark or flag was exercised. Mail was stopped during the account
 preflight, so sender identity and existing Automation authority remain

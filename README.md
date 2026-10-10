@@ -32,8 +32,9 @@ Maintained by **NLINEA**. Current version **0.6.0 is experimental**. This update
 integrates the local 0.5/0.6 features while retaining the public 0.4.3
 digest-confirmed send guard. The earlier independent review covers only 0.4.3,
 not this integration. See [CHANGELOG.md](CHANGELOG.md) for migration notes.
-Actual Mail draft/send, attachment readback, delivery and Send Later behavior
-have not been certified. See
+One separately authorized native saved-copy review checked envelope and attachment
+bytes. Open-editor linkage, HTML rendering, native send/delivery and Send Later
+behavior have not been certified. See
 [VALIDATION.md](VALIDATION.md) for the measured platform and exact limits.
 Read [the CLI contract](skills/apple-mail-cli/references/cli-contract.md) and
 [SECURITY.md](SECURITY.md) before connecting an agent or enabling mutations.
@@ -85,6 +86,8 @@ and filters. A changing Mail index is not a frozen pagination snapshot.
 - visible drafts and replies, plus explicitly confirmed direct sending from an
   explicit configured sender;
 - draft show/verify and revision-guarded full updates; exact Message-ID resolution;
+- revision-guarded draft saving and exact saved-copy attachment-byte reviews,
+  ending at visual/human confirmation without an automatic-send fallback;
 - attachment listing and non-overwriting private export with SHA-256;
 - durable operation receipts, guarded send readback, and accepted-versus-sent states;
 - read-only Sent and Send Later reconciliation by real Message-ID, with a
@@ -191,6 +194,34 @@ persist the final record leaves the intent blocked. Errors after invocation use
 `send_outcome_unknown` with `retryable: false`; a repeated confirmed intent uses
 `send_attempt_exists` before automation runs. Treat both as a stop for review.
 
+## Saved-draft review (manual handoff)
+
+If Mail cannot expose the open editor's attachment references, retain the draft
+and the old send-attempt guard. Do not automatically resend. With authorization
+to save, inspect and save the existing outgoing draft:
+
+```sh
+mailctl draft show OUTGOING_ID
+mailctl draft save OUTGOING_ID --expected-revision READBACK_SHA256 \
+  --confirm-change --operation-id STABLE_SAVE_UUID
+mailctl draft saved-list --account 'Account name' --subject 'Exact subject'
+mailctl draft review-saved '<EXACT_SAVED_RFC_MESSAGE_ID>' --account 'Account name' \
+  --sender sender@example.test --to recipient@example.test --subject 'Exact subject' \
+  --body-file /absolute/body.txt --attachment /absolute/file.txt \
+  --output /absolute/new-private-review.json
+```
+
+Saving can change the stored Message-ID. Select the exact saved candidate; a
+shared subject is not proof that it matches the open editor. The review hashes
+decoded attachment bytes and checks envelope/body expectations in that saved
+copy only. Empty plain text with HTML needs visual Mail review; it does not imply
+the visible message is empty. Even a clean review is only
+`awaiting_human_confirmation`, never send authority. Recheck with
+`--expected-review-digest REVIEW_SHA256` before a separate decision; changed
+content or identity invalidates old evidence. No `send-draft` command is added,
+no uncertain send is unlocked, and no delivery is claimed. Review JSON includes
+private message content and must remain local.
+
 ## Post-send and follow-up review
 
 ```bash
@@ -229,8 +260,11 @@ mailctl campaign session-start campaign-rebalanced.json \
 mailctl campaign session-next /private/render/session.json --limit 20
 ```
 
-The session returns only the next exact visible-UI operations. After each Mail
-operation, record the attempt with `session-record`, then run `session-next` or
+The session returns only the next exact visible-UI operations. After claims are
+acquired, a fresh audit must still agree before the batch is handed out; changed
+or unsafe evidence blocks it. See
+[scheduling recovery](skills/apple-mail-cli/references/scheduling-sessions.md).
+After each Mail operation, record the attempt with `session-record`, then run `session-next` or
 `session-reconcile`. An applied UI action remains `applied_unverified` until
 Sent or Send Later proves the expected state. When Send Later's metadata index
 omits sender or attachment fields, the audit reads only the matching local

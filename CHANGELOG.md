@@ -1,5 +1,36 @@
 # 0.6.0 — 2026-10-10
 
+## Scheduling safety update — 2026-10-11
+
+- Recheck Mail after acquiring all scheduling claims and before returning a
+  batch, bypassing cached attachment evidence. A concurrent session finishing
+  between the initial audit and claim acquisition can no longer cause work to
+  be issued from that stale audit.
+- Stop the whole unissued batch on changed state/Message-ID, unsafe evidence or
+  a failed recheck. Only newly acquired, not-yet-issued claims are released;
+  previously issued work and uncertain/crash-recovery claims remain protected.
+- Add seven synthetic regression tests covering the release/acquire race,
+  reschedule/cancel identity drift, safe unchanged work and multi-row failures.
+
+## Saved-draft review update — 2026-10-11
+
+- Save an existing outgoing draft with a revision check and a durable operation
+  receipt, then list account-scoped saved Drafts candidates without guessing an
+  editor link from their subject.
+- Review one exact saved RFC Message-ID: compare envelope fields and decoded
+  attachment filenames, sizes and SHA-256 values. A review fingerprint rejects
+  changed source, saved identity or expectations on recheck. Review artifacts
+  remain private and the workflow ends at visual inspection and human approval.
+- Accept Mail's complete empty-paragraph editor representation without stripping
+  arbitrary whitespace or changing the approved send digest. Unavailable native
+  attachment enumeration stays unknown, never a verified empty attachment set.
+- Report content-free pre-dispatch failure diagnostics while retaining unknown
+  operation state and the one-attempt send guard. Saved-copy evidence never
+  authorizes an automatic send or unlocks an earlier uncertain attempt.
+- Add negative-path and MIME review regressions. A separately authorized native
+  saved-copy check confirmed envelope and attachment bytes on one local setup;
+  HTML body rendering, editor linkage, native sends and delivery remain unverified.
+
 ## Public-source integration
 
 - Integrates local 0.5/0.6 development into the public 0.4.3 baseline. The 0.5
