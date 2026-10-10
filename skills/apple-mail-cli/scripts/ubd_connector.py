@@ -50,6 +50,7 @@ CAMPAIGN_ISSUES = {
     "wrong_attachment",
     "wrong_recipients",
     "mailbox_unverified",
+    "replica_conflict",
 }
 PROPOSAL_REQUIRED_TOOLS = ["system.capabilities", "work.list", "work.get", "work.propose_update"]
 

@@ -1,6 +1,6 @@
 {
   "name": "apple-mail-cli",
-  "version": "0.4.3",
+  "version": "0.6.0",
   "description": "Shared JSON-first Apple Mail CLI with full-index search, safe high-volume scheduling, dashboards, and UBD OS handoff.",
   "author": {
     "name": "NLINEA"

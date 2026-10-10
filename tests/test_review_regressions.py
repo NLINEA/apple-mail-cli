@@ -31,9 +31,15 @@ class ReviewBodyPropagationTests(unittest.TestCase):
         for argv, responses in ((["classify", "42"], [failure]),
                                 (["triage", "--limit", "1"], [listing, failure])):
             with self.subTest(command=argv[0]), mock.patch.object(mailctl.shutil, "which", return_value="synthetic-osascript"), mock.patch.object(mailctl.subprocess, "run", side_effect=responses), mock.patch.object(mailctl, "classify_message") as classify:
-                with self.assertRaises(mailctl.MailCtlError) as caught:
-                    mailctl.execute(mailctl.build_parser().parse_args(argv))
-                self.assertEqual(caught.exception.code, "mail_command_failed")
+                if argv[0] == "classify":
+                    with self.assertRaises(mailctl.MailCtlError) as caught:
+                        mailctl.execute(mailctl.build_parser().parse_args(argv))
+                    self.assertEqual(caught.exception.code, "mail_command_failed")
+                else:
+                    result = mailctl.execute(mailctl.build_parser().parse_args(argv))
+                    self.assertFalse(result["complete"])
+                    self.assertEqual(result["returned"], 0)
+                    self.assertEqual(result["errors"][0]["code"], "mail_command_failed")
                 classify.assert_not_called()
 
 
@@ -160,7 +166,8 @@ class ReviewCampaignTests(unittest.TestCase):
             attachment.write_bytes(b"approved bytes")
             manifest = self.manifest(root, attachments=[{"path": str(attachment)}])
             audit = self.audit(manifest, [self.row(attachments=[attachment.name], attachment_count=1)])
-        self.assertTrue(audit["complete"])
+        self.assertFalse(audit["complete"])
+        self.assertIn("attachment_unverified", audit["results"][0]["issues"])
         self.assertEqual(audit["results"][0]["verification"]["attachments"]["status"], "metadata_matched")
         self.assertFalse(audit["results"][0]["verification"]["attachments"]["sha256_checked"])
 

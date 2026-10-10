@@ -18,3 +18,9 @@ private/
 send-attempts/
 attempt.json
 backend-claimed/
+operations/
+claims/
+followup-review*.json
+receipt*.json
+*.tgz
+*.tar.gz

@@ -151,7 +151,7 @@ function attachmentList(message) {
       });
     }
   } catch (ignored) {
-    // No attachments.
+    return null; // Unavailable is not proof of zero attachments.
   }
   return result;
 }
@@ -262,8 +262,8 @@ function listCommand(Mail, payload) {
   };
 }
 
-function readCommand(Mail, payload) {
-  var location = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
+function readCommand(Mail, payload, resolvedLocation) {
+  var location = resolvedLocation || resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
   var message = messageById(location, payload.message_id);
   var item = messageSummary(message, location.path);
   // Body access is required for a complete read. A failed read must propagate
@@ -277,7 +277,186 @@ function readCommand(Mail, payload) {
   item.attachments = attachmentList(message);
   item.content = content.slice(0, maxChars);
   item.content_truncated = content.length > maxChars;
+  item.headers = asText(callOr(message, "allHeaders", "")).slice(0, 65536);
   return item;
+}
+
+function readBatchCommand(Mail, payload) {
+  var ids = payload.message_ids;
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 20) throw new Error("Batch requires 1 to 20 message IDs.");
+  var seen = {};
+  for (var j = 0; j < ids.length; j += 1) {
+    if (!Number.isSafeInteger(ids[j]) || ids[j] <= 0 || seen[ids[j]]) throw new Error("Batch IDs must be unique positive integers.");
+    seen[ids[j]] = true;
+  }
+  var location = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
+  var items = [], errors = [], stopped = false, attempted = 0;
+  for (var i = 0; i < ids.length; i += 1) {
+    attempted += 1;
+    try {
+      items.push(readCommand(Mail, { message_id: ids[i], max_chars: payload.max_chars }, location));
+    } catch (error) {
+      var detail = asText(error.message || error);
+      var code = detail.indexOf("-1743") !== -1 || detail.toLowerCase().indexOf("not authorized") !== -1 ? "mail_permission_denied" :
+        detail.indexOf("-1712") !== -1 || detail.toLowerCase().indexOf("timed out") !== -1 ? "mail_automation_timeout" : "message_read_failed";
+      errors.push({ id: ids[i], code: code });
+      if (code !== "message_read_failed") { stopped = true; break; }
+    }
+  }
+  return { items: items, errors: errors, stopped_early: stopped, not_attempted_ids: ids.slice(attempted) };
+}
+
+function draftById(Mail, id) {
+  var draft = Mail.outgoingMessages.byId(Number(id));
+  if (Number(draft.id()) !== Number(id)) throw new Error("Open outgoing draft not found: " + id);
+  return draft;
+}
+
+function draftSnapshot(draft) {
+  var attachments = null;
+  try {
+    var observed = draft.content.attachments();
+    // Some native Mail versions return null even with a visible attachment.
+    // Never turn an unsupported enumeration (or its length) into "no files".
+    if (Array.isArray(observed)) {
+      attachments = observed.map(function (attachment) {
+        return { path: asText(attachment.fileName()) };
+      });
+    }
+  } catch (ignored) { /* Unknown must remain distinguishable from no attachments. */ }
+  function addresses(property) {
+    return draft[property]().map(function (recipient) { return asText(recipient.address()); });
+  }
+  return { draft_id: Number(draft.id()), sender: asText(draft.sender()), subject: asText(draft.subject()),
+    content: asText(draft.content()), to: addresses("toRecipients"), cc: addresses("ccRecipients"),
+    bcc: addresses("bccRecipients"), attachments: attachments, visible: Boolean(draft.visible()) };
+}
+
+function guardDraft(draft, expected) {
+  var current = draftSnapshot(draft);
+  if (!expected || Object.keys(current).some(function (key) { return JSON.stringify(current[key]) !== JSON.stringify(expected[key]); })) {
+    throw new Error("Draft changed since verification. Read and verify it again.");
+  }
+}
+
+function reviewMessageId(value) {
+  if (typeof value !== "string") throw new Error("An exact RFC Message-ID is required.");
+  value = value.trim();
+  if (value.charAt(0) === "<" && value.charAt(value.length - 1) === ">") value = value.slice(1, -1);
+  if (!/^[^\s@<>\x00-\x1f\x7f]+@[^\s@<>\x00-\x1f\x7f]+$/.test(value)) throw new Error("Invalid RFC Message-ID.");
+  return "<" + value + ">";
+}
+
+function savedDraftIdentity(message) {
+  var account = message.mailbox().account();
+  var identity = { numeric_id: Number(message.id()), message_id: reviewMessageId(message.messageId()),
+    account: asText(account.name()), account_id: asText(account.id()) };
+  if (!Number.isInteger(identity.numeric_id) || identity.numeric_id < 0 || !identity.account || !identity.account_id) {
+    throw new Error("Saved draft identity is unavailable.");
+  }
+  return identity;
+}
+
+function savedDraftMatches(Mail, account, predicate) {
+  var candidates = Mail.draftsMailbox().messages.whose(predicate)();
+  if (!Array.isArray(candidates) || candidates.length > 50) throw new Error("Saved Drafts lookup exceeds 50 candidates or is unavailable.");
+  return candidates.filter(function (message) {
+    // Never silently fall back to another account when identity cannot be read.
+    return asText(message.mailbox().account().id()) === asText(account.id());
+  });
+}
+
+function exactSavedDraft(Mail, account, wanted) {
+  var id = reviewMessageId(wanted), seen = {}, matches = [];
+  [id, id.slice(1, -1)].forEach(function (value) {
+    savedDraftMatches(Mail, account, { messageId: value }).forEach(function (message) {
+      var identity = savedDraftIdentity(message);
+      if (identity.message_id !== id) return;
+      var key = identity.account_id + ":" + identity.numeric_id;
+      if (!seen[key]) { seen[key] = true; matches.push(message); }
+    });
+  });
+  if (matches.length !== 1) throw new Error("Message-ID must identify exactly one saved draft in this account; refresh saved-list.");
+  return matches[0];
+}
+
+function savedDraftSource(Mail, account, wanted) {
+  var selected = exactSavedDraft(Mail, account, wanted);
+  var identity = savedDraftIdentity(selected);
+  var source = selected.source();
+  if (typeof source !== "string" || !source || source.length > 40 * 1024 * 1024) throw new Error("Saved MIME source is unavailable or exceeds the review limit.");
+  var reread = exactSavedDraft(Mail, account, wanted);
+  if (JSON.stringify(savedDraftIdentity(reread)) !== JSON.stringify(identity) || reread.source() !== source ||
+      JSON.stringify(savedDraftIdentity(exactSavedDraft(Mail, account, wanted))) !== JSON.stringify(identity)) {
+    throw new Error("Saved draft changed during review. Refresh its exact identity and review again.");
+  }
+  identity.source = source;
+  identity.source_stable = true; // Two matching observations, not a lock on future editor changes.
+  return identity;
+}
+
+function bodyReadbackComparison(actual, expected) {
+  if (typeof actual !== "string" || typeof expected !== "string") return "mismatch";
+  if (actual === expected) return "exact";
+  // Mail renders an empty LF-delimited paragraph as U+2028 followed by LF.
+  // Project the entire approved body. Do not strip anything from readback.
+  var lines = expected.split("\n");
+  var rendered = lines.map(function (line, index) {
+    return line === "" && index < lines.length - 1 ? "\u2028" : line;
+  }).join("\n");
+  return actual === rendered ? "mail_empty_paragraphs" : "mismatch";
+}
+
+function failDraftVerification(current, fields, bodyComparison) {
+  var error = new Error("Draft verification failed; it remains unsent. Inspect the draft and diagnostics; do not retry automatically.");
+  error.diagnostics = { stage: "draft_verification", draft_id: current.draft_id,
+    mismatch_fields: fields, body_comparison: bodyComparison, send_invoked: false };
+  throw error;
+}
+
+function verifySendDraft(draft, payload) {
+  var current = draftSnapshot(draft);
+  function address(value) {
+    var text = lower(value).trim();
+    var match = text.match(/<([^<>]+)>$/);
+    return match ? match[1].trim() : text;
+  }
+  function sameAddresses(actual, expected) {
+    return JSON.stringify(actual.map(address).sort()) === JSON.stringify(expected.map(address).sort());
+  }
+  var mismatches = [], bodyComparison = bodyReadbackComparison(current.content, payload.body);
+  if (address(current.sender) !== payload.sender) mismatches.push("sender");
+  if (current.subject !== payload.subject) mismatches.push("subject");
+  if (bodyComparison === "mismatch") mismatches.push("body");
+  ["to", "cc", "bcc"].forEach(function (field) {
+    if (!sameAddresses(current[field], payload[field])) mismatches.push(field);
+  });
+  if (!Array.isArray(current.attachments)) mismatches.push("attachments_unverified");
+  else {
+    try {
+      var paths = current.attachments.map(function (item) {
+        var value = item.path;
+        if (value.indexOf("file://localhost/") === 0) value = decodeURIComponent(value.slice(16));
+        else if (value.indexOf("file:///") === 0) value = decodeURIComponent(value.slice(7));
+        if (value.charAt(0) !== "/") throw new Error("Not an absolute file reference.");
+        return value;
+      }).sort();
+      if (JSON.stringify(paths) !== JSON.stringify(payload.attachments.slice().sort())) mismatches.push("attachment_references");
+    } catch (_) { mismatches.push("attachments_unverified"); }
+  }
+  if (mismatches.length) failDraftVerification(current, mismatches, bodyComparison);
+  // Recheck the snapshot bytes immediately before dispatch, without issuing a
+  // second one-use claim. Names/sizes/hashes were bound by validateAndClaimSend.
+  try {
+    payload.attachments.forEach(function (name, index) {
+      var data = $.NSData.dataWithContentsOfFile(name);
+      if (!data || Number(data.length) !== payload.attachment_evidence[index].size_bytes ||
+          sha256Data(data) !== payload.attachment_evidence[index].sha256) throw new Error("Snapshot changed.");
+    });
+  } catch (_) { failDraftVerification(current, ["attachment_bytes"], bodyComparison); }
+  try { guardDraft(draft, current); }
+  catch (_) { failDraftVerification(current, ["draft_changed"], bodyComparison); }
+  return current;
 }
 
 function addRecipients(Mail, outgoing, kind, addresses) {
@@ -298,10 +477,9 @@ function addAttachments(Mail, outgoing, paths) {
   }
 }
 
-function createOutgoing(Mail, payload, visible) {
-  if (!payload.to || payload.to.length === 0) throw new Error("At least one recipient is required.");
-  if (payload.sender) {
-    var wanted = lower(payload.sender).trim();
+function validateSender(Mail, sender) {
+  if (sender) {
+    var wanted = lower(sender).trim();
     var accounts = getAccounts(Mail);
     var matches = 0;
     for (var i = 0; i < accounts.length; i += 1) {
@@ -314,6 +492,11 @@ function createOutgoing(Mail, payload, visible) {
     if (matches === 0) throw new Error("Sender is not configured on an enabled Mail account.");
     if (matches > 1) throw new Error("Sender belongs to multiple enabled Mail accounts; resolve the ambiguity before continuing.");
   }
+}
+
+function createOutgoing(Mail, payload, visible) {
+  if (!payload.to || payload.to.length === 0) throw new Error("At least one recipient is required.");
+  validateSender(Mail, payload.sender);
   var outgoing = Mail.OutgoingMessage({ subject: asText(payload.subject), content: asText(payload.body), visible: Boolean(visible) });
   Mail.outgoingMessages.push(outgoing);
   if (payload.sender) outgoing.sender = payload.sender;
@@ -443,21 +626,80 @@ function run(argv) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Invalid backend request.");
     command = asText(payload.command);
     if (command === "ping") {
-      return JSON.stringify({ ok: true, command: command, data: { backend: "apple-mail-jxa", version: "0.4.3" } });
+      return JSON.stringify({ ok: true, command: command, data: { backend: "apple-mail-jxa", version: "0.6.0" } });
     }
 
-    var supported = ["accounts", "mailboxes", "list", "read", "selection", "mark", "flag", "move", "trash", "compose", "send", "reply"];
+    var supported = ["accounts", "mailboxes", "list", "read", "read_batch", "selection", "probe", "resolve", "draft_read", "draft_update", "draft_save", "draft_saved_list", "draft_saved_source", "attachments_list", "attachment_save", "mark", "flag", "move", "trash", "compose", "send", "reply"];
     if (supported.indexOf(command) === -1) throw new Error("Unknown backend command: " + command);
-    if (["mark", "flag", "move"].indexOf(command) !== -1 && payload.confirm_change !== true) throw new Error("Mailbox change requires --confirm-change.");
+    if (["mark", "flag", "move", "draft_update", "draft_save"].indexOf(command) !== -1 && payload.confirm_change !== true) throw new Error("Mailbox change requires --confirm-change.");
+    if (command === "draft_save" && (!Number.isInteger(payload.draft_id) || payload.draft_id < 0 || !payload.expected_snapshot || payload.expected_snapshot.draft_id !== payload.draft_id)) throw new Error("Save requires an exact draft ID and expected snapshot.");
+    if (command === "draft_saved_list" || command === "draft_saved_source") {
+      if (typeof payload.account !== "string" || !payload.account.trim() || /[\x00-\x1f\x7f]/.test(payload.account)) throw new Error("An exact account name is required.");
+      if (command === "draft_saved_list" && (typeof payload.subject !== "string" || !payload.subject || payload.subject.length > 998 || /[\x00-\x1f\x7f]/.test(payload.subject))) throw new Error("An exact subject is required.");
+      if (command === "draft_saved_source") reviewMessageId(payload.rfc_message_id);
+    }
     if (command === "trash" && payload.confirm_trash !== true) throw new Error("Moving mail to Trash requires --confirm-trash.");
     var sendDigest = command === "send" ? validateAndClaimSend(payload) : null;
 
     var Mail = Application("Mail");
     var data;
-    if (command === "accounts") data = accountsCommand(Mail);
+    if (command === "probe") data = { automation_readable: true, account_count: Mail.accounts().length };
+    else if (command === "draft_read") data = draftSnapshot(draftById(Mail, payload.draft_id));
+    else if (command === "draft_save") {
+      var saving = draftById(Mail, payload.draft_id);
+      guardDraft(saving, payload.expected_snapshot);
+      Mail.save(saving);
+      data = { draft: draftSnapshot(saving), save_request_accepted: true, saved_copy_verified: false,
+        revision_scope: "readable_editor_fields_only", sent: false, send_attempted: false,
+        open_draft_link_verified: false, requires_saved_copy_review: true };
+    } else if (command === "draft_saved_list") {
+      var listAccount = findAccount(Mail, payload.account);
+      data = { candidates: savedDraftMatches(Mail, listAccount, { subject: payload.subject }).filter(function (message) {
+          return message.subject() === payload.subject;
+        }).map(function (message) {
+          var item = savedDraftIdentity(message);
+          item.subject = asText(message.subject());
+          item.sender = asText(message.sender());
+          item.date_sent = isoDate(callOr(message, "dateSent", null));
+          return item;
+        }), candidates_only: true, open_draft_link_verified: false, mail_mutated: false };
+    } else if (command === "draft_saved_source") {
+      data = savedDraftSource(Mail, findAccount(Mail, payload.account), payload.rfc_message_id);
+    }
+    else if (command === "draft_update") {
+      if (!payload.confirm_change) throw new Error("Draft update requires --confirm-change.");
+      var editing = draftById(Mail, payload.draft_id);
+      guardDraft(editing, payload.expected_snapshot);
+      validateSender(Mail, payload.sender || payload.expected_snapshot.sender);
+      editing.subject = payload.subject;
+      editing.sender = payload.sender || payload.expected_snapshot.sender;
+      editing.content = payload.body;
+      ["to", "cc", "bcc"].forEach(function (kind) {
+        editing[kind + "Recipients"]().forEach(function (recipient) { Mail.delete(recipient); });
+        addRecipients(Mail, editing, kind, payload[kind] || []);
+      });
+      addAttachments(Mail, editing, payload.attachments || []);
+      data = draftSnapshot(editing);
+    } else if (command === "resolve") {
+      var resolveLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
+      var resolved = resolveLocation.box.messages.whose({ messageId: payload.rfc_message_id })();
+      resolved = resolved.filter(function (item) { return accountMatches(item, resolveLocation.accountFilter); });
+      if (resolved.length !== 1) throw new Error("Message-ID did not resolve to exactly one message in this mailbox.");
+      data = messageSummary(resolved[0], resolveLocation.path);
+    } else if (command === "attachments_list") {
+      data = attachmentList(messageById(resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || ""), payload.message_id));
+    } else if (command === "attachment_save") {
+      var attachmentLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
+      var attachmentMessage = messageById(attachmentLocation, payload.message_id);
+      var attachmentMatches = attachmentMessage.mailAttachments().filter(function (item) { return asText(item.id()) === payload.attachment_id; });
+      if (attachmentMatches.length !== 1) throw new Error("Attachment ID did not match exactly one attachment.");
+      Mail.save(attachmentMatches[0], { in: Path(payload.output) });
+      data = { saved_to: payload.output, attachment_id: payload.attachment_id };
+    } else if (command === "accounts") data = accountsCommand(Mail);
     else if (command === "mailboxes") data = mailboxesCommand(Mail, payload);
     else if (command === "list") data = listCommand(Mail, payload);
     else if (command === "read") data = readCommand(Mail, payload);
+    else if (command === "read_batch") data = readBatchCommand(Mail, payload);
     else if (command === "selection") {
       var selected = Mail.selection();
       data = [];
@@ -467,29 +709,31 @@ function run(argv) {
       var markLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
       var markMessage = messageById(markLocation, payload.message_id);
       markMessage.readStatus = Boolean(payload.read);
-      data = { id: Number(payload.message_id), read: Boolean(payload.read) };
+      data = { id: Number(payload.message_id), read: Boolean(markMessage.readStatus()), verified: Boolean(markMessage.readStatus()) === Boolean(payload.read) };
     } else if (command === "flag") {
       if (!payload.confirm_change) throw new Error("Mailbox change requires --confirm-change.");
       var flagLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
       var flagMessage = messageById(flagLocation, payload.message_id);
       flagMessage.flaggedStatus = Boolean(payload.flagged);
-      data = { id: Number(payload.message_id), flagged: Boolean(payload.flagged) };
+      data = { id: Number(payload.message_id), flagged: Boolean(flagMessage.flaggedStatus()), verified: Boolean(flagMessage.flaggedStatus()) === Boolean(payload.flagged) };
     } else if (command === "move") {
       if (!payload.confirm_change) throw new Error("Mailbox move requires --confirm-change.");
       var fromLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
       var targetLocation = resolveMailbox(Mail, payload.to_mailbox, payload.to_account || "");
       Mail.move(messageById(fromLocation, payload.message_id), { to: targetLocation.box });
-      data = { id: Number(payload.message_id), moved_to: targetLocation.path, account: targetLocation.accountFilter || null };
+      data = { id: Number(payload.message_id), requested_destination: targetLocation.path, account: targetLocation.accountFilter || null, accepted: true, verified: false };
     } else if (command === "trash") {
       if (!payload.confirm_trash) throw new Error("Moving mail to Trash requires --confirm-trash.");
       var trashLocation = resolveMailbox(Mail, payload.mailbox || "INBOX", payload.account || "");
       Mail.delete(messageById(trashLocation, payload.message_id));
-      data = { id: Number(payload.message_id), trashed: true };
+      data = { id: Number(payload.message_id), trash_requested: true, accepted: true, verified: false };
     } else if (command === "compose") {
       var draft = createOutgoing(Mail, payload, true);
-      data = { draft_id: Number(callOr(draft, "id", 0)), visible: true, sent: false };
+      data = draftSnapshot(draft);
+      data.sent = false;
     } else if (command === "send") {
-      var outgoing = createOutgoing(Mail, payload, false);
+      var outgoing = createOutgoing(Mail, payload, true);
+      verifySendDraft(outgoing, payload);
       var sent = Boolean(outgoing.send());
       if (!sent) throw new Error("Mail did not accept the outgoing message for sending.");
       data = { submission_accepted: true, delivery_confirmed: false, outcome: "accepted_by_mail", intent_digest: sendDigest };
@@ -499,12 +743,16 @@ function run(argv) {
       var reply = Mail.reply(original, { openingWindow: true, replyToAll: Boolean(payload.reply_all) });
       reply.content = asText(payload.body) + "\n\n" + asText(callOr(reply, "content", ""));
       reply.visible = true;
-      data = { original_id: Number(payload.message_id), draft_id: Number(callOr(reply, "id", 0)), visible: true, sent: false };
+      data = draftSnapshot(reply);
+      data.original_id = Number(payload.message_id);
+      data.sent = false;
     } else {
       throw new Error("Unknown backend command: " + command);
     }
     return JSON.stringify({ ok: true, command: command, data: data });
   } catch (error) {
-    return JSON.stringify({ ok: false, command: command, error: { type: asText(error.name || "Error"), message: asText(error.message || error) } });
+    var failure = { type: asText(error.name || "Error"), message: asText(error.message || error) };
+    if (error.diagnostics) failure.diagnostics = error.diagnostics;
+    return JSON.stringify({ ok: false, command: command, error: failure });
   }
 }

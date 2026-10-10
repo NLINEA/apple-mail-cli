@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -26,6 +27,13 @@ REQUEST_ID = "50000000-0000-4000-8000-000000000001"
 
 
 class MailCtlTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.dict(os.environ, {"MAILCTL_STATE_DIR": temporary.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def outgoing_args(self, **overrides: object) -> argparse.Namespace:
         values: dict[str, object] = {
             "to": ["Person <person@example.com>"],

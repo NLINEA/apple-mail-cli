@@ -1,8 +1,10 @@
 # Security and validation limits
 
-Version 0.4.3 is experimental. The bounded independent source/synthetic review
-passed; native Mail mutation and delivery behavior remains unverified. Only
-0.4.3 is covered by the recorded review, with no response-time commitment.
+Version 0.6.0 is experimental. The earlier bounded independent review covers
+only 0.4.3; it does not certify this integration. Fresh 0.6.0 regression results
+are in VALIDATION.md. One native draft-save and saved-copy review is recorded
+there; other native mutation behavior and delivery remain unverified, with no
+response-time commitment.
 
 For a security report, use this repository's Security tab and **Report a
 vulnerability** when GitHub private vulnerability reporting is available. Its
@@ -25,7 +27,9 @@ distributed idempotency. Deleting state, changing intent or using another
 user/host bypasses that local protection. Do not do so to retry uncertain mail.
 
 Source attachments are snapshotted and hashed before invocation, then checked
-again by the backend before its claim. Mode 0400 makes snapshots read-only in
+again by the backend before its claim and immediately before send. The backend
+also requires matching observable draft fields and attachment references.
+Mode 0400 makes snapshots read-only in
 normal use; the owner can still change permissions. Mail's actual recipient,
 body transformation, attachment readback and asynchronous behavior require
 native tests. A passed protocol fixture does not establish final Mail content.
@@ -40,8 +44,11 @@ search does not provide full-body or remote-server coverage.
 ## Privacy and permissions
 
 Raw reads, send previews, rendered campaigns, attachment snapshots and local
-evidence caches are private. The send journal contains only digest, timestamps
-and state, but its attachment snapshots contain approved file bytes/names.
+evidence caches are private. The digest attempt journal contains only digest,
+timestamps and state, but its attachment snapshots contain approved file
+bytes/names. Separate operation receipts may include private draft text and
+metadata, saved send-intent metadata, or UBD work detail. Follow-up worklists
+and Sent observations are also private. Never publish these artifacts.
 Keep the persistent reservation after reviewing any snapshot-retention cleanup;
 no cleanup automation is provided. CLI argument values can appear in process
 listings and shell history. `--body-file` avoids putting the body in those flags.
@@ -57,7 +64,9 @@ provider credentials or external API. UBD OS access is separate and optional.
 ## Additional native validation
 
 Independent review of the 0.4.3 protocol passed. Native Mail validation remains
-separate, explicitly authorized work. Existing read-only index access and a
+separate, explicitly authorized work. The following paragraph records the older
+0.4.3 checks; see VALIDATION.md for the later bounded saved-draft review.
+Existing read-only index access and a
 bounded synthetic-subject metadata query succeeded; no real draft, send,
 delete, move, mark or flag was exercised. Mail was stopped during the account
 preflight, so sender identity and existing Automation authority remain
@@ -87,5 +96,8 @@ A minimal staged native check is:
 Cross-version testing, CI, provider coverage and native mutation checks are
 follow-up validation. Their absence limits the claims of this experimental
 source release; it is not a reason to claim that synthetic tests certify them.
-Offset pagination may repeat/skip rows when the index changes. Publishing source
+Keyset pagination is not a frozen snapshot; timestamp changes and deletions
+can still affect results. Cross-campaign claims require all workers to use the
+current version and shared local state; old-version active claims cover only
+their legacy scope. Publishing source
 does not replace a user's installation or authorize Mail mutations.
